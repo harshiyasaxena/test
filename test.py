@@ -1,38 +1,69 @@
-def validate_and_color(self):
-    wb = load_workbook(self.excel_file)
-    ws_data = wb["DATA"]
-    ws_inputs = wb["inputs"]
+def check_wy_dsi(self):
+    from openpyxl.styles import PatternFill
 
-    # Step 1: Extract JK → Description mapping
-    jk_to_desc = {}
-    current_jk = None
-    for row in ws_data.iter_rows(min_row=2, values_only=True):
-        if row[0]:  # Column A has value
-            current_jk = str(row[0]).strip()
+    pn_to_wy = {}
+    last_pn = None
+    pending_pn = None
 
-        if current_jk and str(row[0]).strip() == "KJ":
-            # Collect description text from cols D–L (index 3–11)
-            desc_parts = [str(cell).strip() for cell in row[3:12] if cell]
-            desc_text = " ".join(desc_parts)
-            jk_to_desc[current_jk] = desc_text
-            print(f"[DATA] JK={current_jk}, Description={desc_text}")
+    # --- Step 1: Map PN to WY value from Sheet2 ---
+    for row in self.sheet2.iter_rows(min_row=1):
+        a_val = str(row[0].value).strip() if row[0].value else None
 
-    # Step 2: Loop over INPUTS sheet
-    for row in ws_inputs.iter_rows(min_row=2):
-        fish_ko = str(row[9].value).strip() if row[9].value else None   # col J
-        hehe = str(row[11].value).strip() if row[11].value else None   # col L
-        usp = str(row[12].value).strip() if row[12].value else None    # col M
+        if not a_val:
+            continue
 
-        print(f"[INPUTS] Fish Ko={fish_ko}, HEHE={hehe}, USP={usp}")
+        # "JK" means next row has PN
+        if a_val.upper() == "JK":
+            pending_pn = True
+            continue
 
-        if usp == "KJ" and fish_ko in jk_to_desc:
-            desc = jk_to_desc[fish_ko]
-            print(f"   Comparing HEHE='{hehe}' with DESC='{desc}'")
-            if hehe == desc:
-                row[11].fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
-                print("   → GREEN")
+        if pending_pn:
+            last_pn = a_val
+            pending_pn = False
+            continue
+
+        # Search the row for "WY" (not only col A!)
+        for cell in row:
+            if str(cell.value).strip().upper() == "WY" and last_pn:
+                wy_cell = self.sheet2.cell(row=cell.row + 1, column=cell.column)  # value below WY
+                wy_val = str(wy_cell.value).strip() if wy_cell.value else None
+                if wy_val:
+                    try:
+                        wy_val = int(wy_val)
+                    except:
+                        wy_val = 0
+                    pn_to_wy[last_pn] = wy_val
+                    print(f"Mapped PN={last_pn} -> WY={wy_val} (from row {cell.row})")
+                last_pn = None
+
+    # --- Step 2: Walk Sheet3 and apply WY+DSI rules ---
+    last_part_no = None
+    for row in self.sheet3.iter_rows(min_row=2):
+        if row[9].value:  # Part number in col J
+            last_part_no = str(row[9].value).strip()
+
+        part_no = last_part_no
+        if not part_no or part_no not in pn_to_wy:
+            continue
+
+        wy_val = pn_to_wy[part_no]
+
+        # DSI col = M (index 12)
+        dsi_val = str(row[12].value).strip() if row[12].value else None
+        # T col = col T (index 19)
+        t_val = str(row[19].value).strip() if row[19].value else None
+
+        if dsi_val == "MU":
+            if wy_val == 1:
+                for cell in row:
+                    cell.fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+                print(f"[GREEN] PN={part_no}, WY=1, DSI=MU (row {row[0].row})")
             else:
-                row[11].fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-                print("   → RED")
-
-    wb.save(self.excel_file)
+                if t_val == "D":
+                    for cell in row:
+                        cell.fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+                    print(f"[GREEN] PN={part_no}, WY={wy_val}, DSI=MU, T=D (row {row[0].row})")
+                else:
+                    for cell in row:
+                        cell.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+                    print(f"[RED] PN={part_no}, WY={wy_val}, DSI=MU, T={t_val} (row {row[0].row})")
