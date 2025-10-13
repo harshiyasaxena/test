@@ -1,46 +1,36 @@
-# pulse_playwright.py
-import asyncio
 import os
-import re
+import time
 import string
+import asyncio
 import traceback
-from typing import List, Optional, Dict
+from typing import Optional, List
 
-import pdfplumber
-import pandas as pd
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
+import openpyxl
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Page
+from openpyxl.styles import Alignment, PatternFill, Font, Border, Side
 
-# -------------------------
-# Configuration
-# -------------------------
-MAX_CONCURRENT = 4  # number of parallel pages/workers (tune for speed)
-BROWSER_HEADLESS = False  # set True to run headless
-AUTOSAVE_PATH = r"C:\PULSE_Auto\PULSE_AUTO.xlsx"  # temp autosave used similarly to your old script
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Page, Browser
 
-# -------------------------
-# Helper types
-# -------------------------
-PartResult = Dict[str, object]  # structure to return row-data for a single part (flexible)
+# ---------- Configuration ----------
+BASE_URL = "https://hihi.com"             # your real site
+CONCURRENCY = 4                            # number of parallel pages/tasks
+PAGE_TIMEOUT = 20000                       # ms timeout for Playwright waits
+HEADLESS = True                            # set False to watch the browser open
+# -----------------------------------
 
 
-# -------------------------
-# Main App (keeps Tkinter UI + openpyxl behavior)
-# -------------------------
 class App:
     def __init__(self):
-        # Tkinter setup (kept like original)
+        # tkinter kept for compatibility — we will not show UI by default (same as original)
         self.root = tk.Tk()
         self.root.title("PULSE")
         self.root.withdraw()
 
-        # State variables
+        # Excel / workbook related
         self.Part_nos: List[str] = []
-        self.excel_file: Optional[str] = None
         self.folder_path: Optional[str] = None
         self.filename: Optional[str] = None
         self.workbook = None
@@ -49,693 +39,595 @@ class App:
         self.sheet3 = None
         self.row_index = 1
 
-        # Excel styles (mirrors your original style attributes)
+        # Formatting
         self.green = PatternFill(start_color='c6efce', end_color='c6efce', fill_type='solid')
         self.red = PatternFill(start_color='ffc7ce', end_color='ffc7ce', fill_type='solid')
-        self.blue = PatternFill(start_color='305496', end_color='305496', fill_type='solid')
-        self.Thin_border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                  top=Side(style='thin'), bottom=Side(style='thin'))
-        self.Thick_border = Border(left=Side(style='thick'), right=Side(style='thick'),
-                                   top=Side(style='thick'), bottom=Side(style='thick'))
+        thin = Side(style='thin')
+        self.Thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        self.blue = PatternFill(start_color='4F81BD', end_color='4F81BD', fill_type='solid')  # choose a blue
         self.bold_font = Font(bold=True)
-        self.Center_align = Alignment(horizontal='center', vertical='center')
 
-        # Async locks
-        self.workbook_lock = asyncio.Lock()  # ensure only one coroutine writes to workbook at a time
+        # Playwright runtime objects (set in run_playwright)
+        self.browser: Optional[Browser] = None
+        self.context = None
+        self.base_page: Optional[Page] = None
 
-    # -------------------------
-    # Excel and input initialization (similar to Basic)
-    # -------------------------
-    def Basic(self):
-        """Open workbook, clear/create PULSE DATA, and read Part_nos from INPUTS column B (starting row 2)."""
-        # Let user pick the file via dialog (keeps UX similar to your tkinter usage)
-        file_path = filedialog.askopenfilename(title="Select input Excel file",
-                                               filetypes=[("Excel files", "*.xlsx;*.xlsm;*.xltx;*.xltm")])
-        if not file_path:
-            messagebox.showerror("No file", "No Excel file selected.")
-            self.root.quit()
-            return
-
-        self.excel_file = file_path
-        self.folder_path, self.filename = os.path.split(file_path)
-
-        # Load workbook
+    # ---------- Excel helpers ----------
+    def open_workbook(self, folder_path: str, filename: str):
+        """Load workbook and prepare sheets — mirrors original behavior with safe checks."""
+        self.folder_path = folder_path
+        self.filename = filename
+        file_path = os.path.join(folder_path, filename)
         self.workbook = load_workbook(file_path)
-        # If PULSE Data exists in old variants of your code: remove and recreate (keeps behavior)
-        if "PULSE DATA" in [s.upper() for s in self.workbook.sheetnames]:
-            # remove any case variant
-            for name in list(self.workbook.sheetnames):
-                if name.upper() == "PULSE DATA":
-                    std = self.workbook[name]
-                    self.workbook.remove(std)
-        # Create new "PULSE DATA"
-        self.workbook.create_sheet("PULSE DATA")
+
+        # If "PULSE DATA" exists, remove and recreate
+        if "PULSE DATA" in self.workbook.sheetnames:
+            std = self.workbook["PULSE DATA"]
+            self.workbook.remove(std)
+            self.workbook.create_sheet("PULSE DATA")
+
+        # Ensure sheets exist (INPUTS and Report Data assumed to exist)
+        if "INPUTS" not in self.workbook.sheetnames:
+            raise ValueError("INPUTS sheet not found in workbook.")
+        if "Report Data" not in self.workbook.sheetnames:
+            # create if missing
+            self.workbook.create_sheet("Report Data")
+
         self.sheet1 = self.workbook["INPUTS"]
         self.sheet2 = self.workbook["PULSE DATA"]
-        # If original had "Report Data" sheet, keep reference (if present)
-        if "Report Data" in self.workbook.sheetnames:
-            self.sheet3 = self.workbook["Report Data"]
-        else:
-            self.sheet3 = None
+        self.sheet3 = self.workbook["Report Data"]
 
-        # Adjust columns widths (mirror from original)
-        widths = [20, 20, 20, 20, 10, 20, 10, 10, 20, 20, 26, 10, 20, 20]
-        for col_letter, w in zip(string.ascii_uppercase[:len(widths)], widths):
-            self.sheet2.column_dimensions[col_letter].width = w
+        # Set column widths (same as original)
+        col_widths = {
+            'A': 20, 'B': 20, 'C': 20, 'D': 20, 'E': 10, 'F': 20,
+            'G': 10, 'H': 10, 'I': 20, 'J': 20, 'K': 26, 'L': 10,
+            'M': 20, 'N': 20
+        }
+        for col, w in col_widths.items():
+            self.sheet2.column_dimensions[col].width = w
 
-        # Read part numbers from column B starting at row 2 (Selenium code used sheet1['B'][1:])
+    def read_part_numbers(self):
+        """Read part numbers from column B starting at row 2 (index 1 in openpyxl)."""
         self.Part_nos = []
-        for cell in self.sheet1['B'][1:]:
+        # openpyxl uses 1-based indexing; sheet['B'] returns cells in column B including header
+        col_b = self.sheet1['B']
+        # skip header (index 0)
+        for cell in col_b[1:]:
             if cell.value is None:
                 break
             self.Part_nos.append(str(cell.value).strip())
 
-        # Start row index at 1 (like your code). We'll append rows using this shared counter.
-        self.row_index = 1
+    # ---------- Playwright interactions ----------
+    async def run_playwright(self):
+        """Main orchestration: launch browser, perform initial setup, then parallel extraction."""
+        async with async_playwright() as pw:
+            browser = await pw.firefox.launch(headless=HEADLESS)
+            self.browser = browser
+            # create shared context (will be used to spawn pages for parallel tasks)
+            context = await browser.new_context()
+            self.context = context
 
-    # -------------------------
-    # Core: run Playwright and manage parallel workers
-    # -------------------------
-    async def run_playwright_parallel(self):
-        """
-        Creates a single browser and context, then runs multiple page workers concurrently.
-        For each part number, we open a new page (tab) and run the same logic as your original script.
-        Workbook writes are synchronized with self.workbook_lock to avoid corruption.
-        """
-        if not self.Part_nos:
-            print("No parts to process.")
-            return
+            # Create initial page to perform initial clicks/flows (Continue -> new window)
+            page = await context.new_page()
+            self.base_page = page
+            page.set_default_timeout(PAGE_TIMEOUT)
 
-        playwright = await async_playwright().start()
-        # Launch Firefox (maps to webdriver.Firefox() in Selenium)
-        browser = await playwright.firefox.launch(headless=BROWSER_HEADLESS)
-        context = await browser.new_context()
-
-        # Open initial page (like self.driver.get('https://hihi.com'))
-        # We'll create a "starter" page to handle any initial click that opens new window in original.
-        starter_page = await context.new_page()
-        await starter_page.goto("https://hihi.com", timeout=60000)
-
-        # Try to click 'Continue' input if present (Selenium used find_elements and click)
-        try:
-            # Playwright locator: input[value="Continue"]
-            continue_locator = starter_page.locator('input[value="Continue"]')
-            if await continue_locator.count() > 0:
+            await page.goto(BASE_URL)
+            # Try to click a Continue input if present
+            try:
+                # try to click input with value Continue (like original)
+                await page.locator('input[value="Continue"]').click(timeout=5000)
+            except PlaywrightTimeoutError:
+                # fallback: try to find any input and click first with value attribute Continue
                 try:
-                    await continue_locator.first.click(timeout=5000)
-                except PlaywrightTimeoutError:
+                    inputs = page.locator("input")
+                    count = await inputs.count()
+                    for i in range(count):
+                        val = await inputs.nth(i).get_attribute("value")
+                        if val and val.strip() == "Continue":
+                            await inputs.nth(i).click()
+                            break
+                except Exception:
                     pass
-        except Exception:
-            pass
-
-        # After possible click, wait for network idle (represents page load)
-        try:
-            await starter_page.wait_for_load_state('networkidle', timeout=30000)
-        except Exception:
-            # ignore timeouts; continue
-            pass
-
-        # If the original flow opens a new window, Playwright's context.pages will include it.
-        # We'll use the last page for worker templates. But we will create fresh pages per worker.
-        # Use semaphore to limit concurrency
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-
-        # Create a list of tasks
-        tasks = []
-        for part_no in self.Part_nos:
-            task = asyncio.create_task(self._worker_process_part(context, part_no, semaphore))
-            tasks.append(task)
-
-        # Wait for all tasks to finish
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Save workbook final and cleanup
-        async with self.workbook_lock:
-            try:
-                self.workbook.save(os.path.join(self.folder_path, self.filename))
             except Exception:
-                # fallback: try autosave path
+                pass
+
+            # Wait for potential new page (the original Selenium switched to last window)
+            # If the click opens a new window/tab, Playwright can detect it.
+            # Give it a short window to open.
+            await asyncio.sleep(1)
+            pages = context.pages
+            if len(pages) > 1:
+                # use last opened page as base
+                self.base_page = pages[-1]
+
+            # Now export storage state if we want, but since we're reusing same context and pages,
+            # we will spawn multiple pages from the same context to reuse cookies/session.
+            # Read part numbers
+            self.read_part_numbers()
+
+            # Prepare Excel starting row index
+            # We'll place results starting at row 1 as in original; however preserve last used row if needed
+            self.row_index = 1
+
+            # Use a semaphore to limit concurrency
+            sem = asyncio.Semaphore(CONCURRENCY)
+            tasks = []
+            for part_no in self.Part_nos:
+                tasks.append(self._bounded_extract(sem, part_no))
+
+            # run all tasks
+            await asyncio.gather(*tasks)
+
+            # After all extraction done, apply alignment and save workbook
+            self._finalize_and_save()
+
+            # close context and browser
+            await context.close()
+            await browser.close()
+
+    async def _bounded_extract(self, sem: asyncio.Semaphore, part_no: str):
+        """Wrap each extraction task with semaphore to limit concurrency."""
+        async with sem:
+            try:
+                await self.extract_for_part(part_no)
+            except Exception:
+                traceback.print_exc()
+
+    async def extract_for_part(self, Part_no: str):
+        """Translate your main_code logic for one Part_no into Playwright operations and write to Excel."""
+        page = await self.context.new_page()
+        page.set_default_timeout(PAGE_TIMEOUT)
+
+        # Save workbook frequently (original saved each loop)
+        try:
+            self.workbook.save(os.path.join(self.folder_path, self.filename))
+        except Exception:
+            pass
+
+        # Example initial writes (mirrors original)
+        # Note: openpyxl append will place values at next free row by design; we replicate more control
+        # We'll write cells explicitly using current self.row_index and increment accordingly,
+        # but because tasks run in parallel we must protect writes to workbook (not thread-safe).
+        # So we implement a simple lock around workbook writes using asyncio.Lock.
+        # For simplicity and safety, we'll collect rows in-memory and append them using a write lock.
+
+        # We will use an asyncio.Lock attached to self for workbook writes
+        if not hasattr(self, "_wb_lock"):
+            self._wb_lock = asyncio.Lock()
+
+        # 1) Initialize header-ish rows similar to original first writes
+        async with self._wb_lock:
+            r = self.row_index
+            self.sheet2[f'A{r}'] = "JK"
+            self.sheet2[f'B{r}'] = "Def Mef"
+            self.sheet2[f'C{r}'] = "JIR"
+
+            # color first three columns
+            for let in string.ascii_uppercase[:3]:
+                self.sheet2[f'{let}{r}'].fill = self.blue
+                self.sheet2[f'{let}{r}'].font = Font(color="ffffff", bold=True)
+                self.sheet2[f'{let}{r}'].border = self.Thin_border
+
+            self.row_index += 1
+            current_row_for_part = self.row_index
+            self.sheet2[f'A{current_row_for_part}'] = Part_no
+            self.row_index += 1
+
+            # Save index snapshot for writing later values to avoid race on self.row_index
+            start_row = current_row_for_part
+
+        # Fill the search box and trigger JS as in original
+        try:
+            # find search element
+            try:
+                await page.fill("#searchkalu", Part_no, timeout=5000)
+            except PlaywrightTimeoutError:
+                # sometimes element id contains periods; try alternative find
                 try:
-                    self.workbook.save(AUTOSAVE_PATH)
+                    el = page.locator('[id="searchkalu"]')
+                    await el.fill(Part_no)
                 except Exception:
-                    traceback.print_exc()
-
-        # close Playwright
-        await context.close()
-        await browser.close()
-        await playwright.stop()
-
-        # open workbook (like os.startfile in your original)
-        try:
-            os.startfile(os.path.join(self.folder_path, self.filename))
-        except Exception:
-            # ignore platform issues
-            pass
-
-        # print any exceptions from tasks
-        for r in results:
-            if isinstance(r, Exception):
-                print("Task failed:", r)
-
-    # -------------------------
-    # Worker: do the automation for a single part number
-    # Mirrors your main_code loop body but for one part
-    # -------------------------
-    async def _worker_process_part(self, context, Part_no: str, semaphore: asyncio.Semaphore) -> Optional[PartResult]:
-        """
-        Each worker opens its own page and performs the interactions for one Part_no.
-        All writes to the workbook are done under self.workbook_lock.
-        """
-        await semaphore.acquire()
-        page: Page = await context.new_page()
-        try:
-            # -------------------------
-            # Navigation & initial clicks
-            # -------------------------
-            # Equivalent of driver.get(...) and switching windows
-            await page.goto("https://hihi.com", timeout=60000)
-            # replace sleeps with waits
-            try:
-                # Try to click #hello and #hilli if present (maps to WebDriverWait(...).click() in your code)
-                for sel in ("#hello", "#hilli"):
-                    try:
-                        locator = page.locator(sel)
-                        if await locator.count() > 0:
-                            try:
-                                await locator.first.click(timeout=5000)
-                            except PlaywrightTimeoutError:
-                                pass
-                    except Exception:
-                        pass
+                    pass
             except Exception:
                 pass
 
-            # Wait for page to be stable
+            # Execute original JS call
             try:
-                await page.wait_for_load_state("networkidle", timeout=20000)
+                await page.evaluate("showFile('1');")
             except Exception:
                 pass
 
-            # -------------------------
-            # Prepare initial rows for this part (mirrors how your loop writes "JK", "Def Mef", "JIR" then modifies)
-            # We'll collect the changes to write with workbook_lock to avoid collisions
-            # -------------------------
-            # Prepare a batch of cell updates to write later
-            write_updates = []  # list of tuples (cell, value, optional_style)
-            # In original code, before searching they saved workbook and wrote A row with JK etc
-            write_updates.append((f"A{self.row_index}", "JK"))
-            write_updates.append((f"B{self.row_index}", "Def Mef"))
-            write_updates.append((f"C{self.row_index}", "JIR"))
+            # small wait to allow page to update
+            await asyncio.sleep(0.5)
 
-            # Apply header styles on columns A-C in this row
-            header_cells = [f"{let}{self.row_index}" for let in string.ascii_uppercase[:3]]
-            # We'll apply styles when writing to workbook under lock
-
-            # Simulate search interactions (Selenium: find_element, clear, execute_script)
+            # get def_mef and jir values from DOM
+            def_mef = None
+            jir = None
             try:
-                search_locator = page.locator("#searchkalu")
-                # clear (Playwright fill with empty string)
-                if await search_locator.count() > 0:
-                    await search_locator.fill("")  # equivalent to clear()
-                # execute_script showFile('1) or "showFile('1');" in your code had a small typo - we call the intended value
-                # original: self.driver.execute_script("showFile('1);") <- broken quotes; assuming showFile('1')
+                def_mef = await page.get_attribute('#moderbean\\.defmed', 'value')
+            except Exception:
+                # try alternate id with dot as part of id (escaped)
                 try:
-                    await page.evaluate("showFile('1');")
+                    def_mef = await page.locator('[id="moderbean.defmed"]').get_attribute('value')
                 except Exception:
-                    # fallback: try with double quotes
-                    try:
-                        await page.evaluate('showFile("1");')
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    def_mef = ""
 
-            # Save/writing initial JK row to workbook
-            async with self.workbook_lock:
-                # Write the header row and apply styles
-                for (cell, value) in write_updates:
-                    self.sheet2[cell] = value
+            try:
+                jir = await page.get_attribute('#moderbean\\.jir', 'value')
+            except Exception:
+                try:
+                    jir = await page.locator('[id="moderbean.jir"]').get_attribute('value')
+                except Exception:
+                    jir = ""
+
+            # Write def_mef and jir back into Excel (acquire lock)
+            async with self._wb_lock:
+                self.sheet2[f'B{start_row}'] = def_mef
+                self.sheet2[f'C{start_row}'] = jir
+
+                # color these cells same as earlier
                 for let in string.ascii_uppercase[:3]:
-                    c = self.sheet2[f"{let}{self.row_index}"]
-                    c.fill = self.blue
-                    c.font = Font(color="FFFFFF", bold=True)
-                    c.border = self.Thin_border
+                    self.sheet2[f'{let}{start_row}'].fill = self.blue
+                    self.sheet2[f'{let}{start_row}'].border = self.Thin_border
 
-                # Save an autosave (like original)
-                try:
-                    self.workbook.save(AUTOSAVE_PATH)
-                except Exception:
-                    pass
-
-            # Move row index forward and write Part_no row (same as original)
-            # NOTE: Since multiple workers share self.row_index, we must update this under the lock
-            async with self.workbook_lock:
-                this_row = self.row_index + 1
-                self.sheet2[f"A{this_row}"] = Part_no
-                # increment shared row_index to reflect reserved rows used by this worker
-                # We'll increment by 1 here; later writes will also increment under the lock where needed
-                self.row_index = this_row
-
-            # -------------------------
-            # Extract def_mef and jir from page (Selenium used .get_attribute('value') on element by ID)
-            # Playwright equivalent: locator.input_value() or get_attribute('value')
-            # IDs: 'moderbean.defmed' and 'moderbean.jir'
-            # Note: Playwright selectors with dots require escaping the dot with \\.
-            # -------------------------
-            try:
-                def_mef_val = await page.locator("#moderbean\\.defmed").input_value(timeout=3000)
-            except Exception:
-                def_mef_val = ""
-            try:
-                jir_val = await page.locator("#moderbean\\.jir").input_value(timeout=3000)
-            except Exception:
-                jir_val = ""
-
-            # write the def_mef and jir into the same row (this_row)
-            async with self.workbook_lock:
-                self.sheet2[f"B{this_row}"] = def_mef_val
-                self.sheet2[f"C{this_row}"] = jir_val
-                # style the A-C cells for this row
-                for let in string.ascii_uppercase[:3]:
-                    c = self.sheet2[f"{let}{this_row}"]
-                    c.fill = self.blue
-                    c.border = self.Thin_border
-
-            # prepare next row for FC section like original (increment row_index)
-            async with self.workbook_lock:
-                self.row_index += 1
-                fc_row = self.row_index  # this will be used to write FC header/title rows
-
-                # Write "FC" cell and style (mirrors original)
-                self.sheet2[f"A{fc_row}"] = "FC"
-                self.sheet2[f"A{fc_row}"].fill = self.blue
-                self.sheet2[f"A{fc_row}"].border = self.Thin_border
-                self.sheet2[f"A{fc_row}"].font = Font(color="FFFFFF", bold=True)
-
-                # Merge B:C for FC Title (the original used B{row}:C{row})
-                merge_title = f"B{fc_row}:C{fc_row}"
-                self.sheet2[f"B{fc_row}"] = "FC Title"
-                self.sheet2[f"B{fc_row}"].fill = self.blue
-                self.sheet2[f"B{fc_row}"].border = self.Thin_border
-                self.sheet2[f"B{fc_row}"].font = Font(color="FFFFFF", bold=True)
-                try:
-                    self.sheet2.merge_cells(merge_title)
-                except Exception:
-                    pass
-
-                # Merge D:L for FC Text and set value
-                merge_text = f"D{fc_row}:L{fc_row}"
-                self.sheet2[f"D{fc_row}"] = "FC Text"
-                self.sheet2[f"D{fc_row}"].fill = self.blue
-                self.sheet2[f"D{fc_row}"].border = self.Thin_border
-                self.sheet2[f"D{fc_row}"].font = Font(color="FFFFFF", bold=True)
-                try:
-                    self.sheet2.merge_cells(merge_text)
-                except Exception:
-                    pass
-
-                # Merge M:N for Revised
-                merge_rev = f"M{fc_row}:N{fc_row}"
-                self.sheet2[f"M{fc_row}"] = "Revised"
-                self.sheet2[f"M{fc_row}"].fill = self.blue
-                self.sheet2[f"M{fc_row}"].border = self.Thin_border
-                self.sheet2[f"M{fc_row}"].font = Font(color="FFFFFF", bold=True)
-                try:
-                    self.sheet2.merge_cells(merge_rev)
-                except Exception:
-                    pass
-
-            # increment row_index and then call showFile('4') (mapping to your driver.execute_script("showFile('4');"))
+            # Next: write FC-related rows similar to original. We'll attempt to replicate flows:
+            # simulate clicking showFile('4') if needed
             try:
                 await page.evaluate("showFile('4');")
             except Exception:
-                try:
-                    await page.evaluate('showFile("4");')
-                except Exception:
-                    pass
-
-            # small wait for UI to render after showFile
-            try:
-                await page.wait_for_timeout(1000)
-            except Exception:
                 pass
 
-            # -------------------------
-            # FC extraction loop: find inputs that start with name "fcthoda[" (original xpath)
-            # Playwright: use locator('xpath=//input[starts-with(@name,"fcthoda[")]')
-            # Then for each matched_index try to read fcbean[{i}].fc .value and check if in FC_text_code
-            # -------------------------
-            FC_text_code = ['1', '2', '3', '4', 'MF', 'AB']
-            try:
-                fc_inputs = page.locator('xpath=//input[starts-with(@name,"fcthoda[")]')
-                count_fc = await fc_inputs.count()
-            except Exception:
-                count_fc = 0
+            await asyncio.sleep(0.4)
 
+            # FC codes that we consider interesting
+            FC_text_code = ['1', '2', '3', '4', 'MF', 'AB']
+            # Locate all inputs starting with name fcthoda[
+            fc_inputs = page.locator('//input[starts-with(@name,"fcthoda[")]')
+            count_fc_inputs = await fc_inputs.count()
             Matched_index = 0
-            # we'll iterate up to count_fc or a safe max to avoid runaway loops
-            for _ in range(count_fc):
+
+            # We'll iterate by index because your later code used Matched_index
+            for idx in range(count_fc_inputs):
                 try:
-                    # original: exact_fc = driver.find_element(By.NAME, f'fcbean[{Matched_index}].fc')
-                    name_selector = f'[name="fcbean[{Matched_index}].fc"]'
-                    if await page.locator(name_selector).count() == 0:
+                    # exact_fc element by name 'fcbean[{Matched_index}].fc' (note case variations in original)
+                    name_selector = f'input[name="fcbean[{Matched_index}].fc"], input[name="fcBean[{Matched_index}].fc"]'
+                    exact = page.locator(name_selector)
+                    if await exact.count() == 0:
                         Matched_index += 1
                         continue
-                    FC_code = await page.locator(name_selector).input_value(timeout=2000)
+                    FC_code = await exact.first.get_attribute('value')
                 except Exception:
                     Matched_index += 1
                     continue
 
                 if FC_code in FC_text_code:
-                    # Write header for FC code row
-                    async with self.workbook_lock:
-                        cur = self.row_index
-                        self.sheet2[f"A{cur}"] = "FC Code"
-                        self.sheet2[f"A{cur}"].fill = self.blue
-                        self.sheet2[f"A{cur}"].border = self.Thin_border
-                        self.sheet2[f"A{cur}"].font = Font(color="FFFFFF", bold=True)
+                    # Acquire write lock to safely write rows
+                    async with self._wb_lock:
+                        r = self.row_index
+                        self.sheet2[f'A{r}'] = "FC Code"
+                        self.sheet2[f'A{r}'].fill = self.blue
+                        self.sheet2[f'A{r}'].border = self.Thin_border
+                        self.sheet2[f'A{r}'].font = Font(color="ffffff", bold=True)
 
-                        # merge B:C for title and put title
-                        merge_TITLE = f"B{cur}:C{cur}"
+                        merge_title = f'B{r}:C{r}'
+                        fc_title = ""
                         try:
-                            fc_title = await page.locator(f'[name="fcBean[{Matched_index}].fcTitle"]').input_value(timeout=2000)
+                            fc_title = await page.get_attribute(f'input[name="fcBean[{Matched_index}].fcTitle"]', 'value')
                         except Exception:
-                            fc_title = ""
-                        self.sheet2[f"B{cur}"] = fc_title
+                            try:
+                                fc_title = await page.get_attribute(f'input[name="fcbean[{Matched_index}].fcTitle"]', 'value')
+                            except Exception:
+                                fc_title = ""
+
+                        self.sheet2[f'B{r}'] = fc_title
+                        # merging cells
                         try:
-                            self.sheet2.merge_cells(merge_TITLE)
+                            self.sheet2.merge_cells(merge_title)
                         except Exception:
                             pass
 
-                        # merge D:L for FC text and fill
-                        merge_cell_FC = f"D{cur}:L{cur}"
-                        # try different possible element names similar to your try/except chain
+                        # FC text
                         frm = ""
                         try:
-                            frm = await page.locator(f'[name="FCText[{Matched_index}].freeFormTxt"]').input_value(timeout=1000)
+                            frm = await page.get_attribute(f'input[name="FCText[{Matched_index}].freeFormTxt"]', 'value')
                         except Exception:
                             try:
-                                frm = await page.locator(f'[name="fcText[{Matched_index}].overLengthPArt"]').input_value(timeout=1000)
+                                frm = await page.get_attribute(f'input[name="fcText[{Matched_index}].overLengthPArt"]', 'value')
                             except Exception:
                                 try:
-                                    frm = await page.locator(f'[name="fcText[{Matched_index}].specNum"]').input_value(timeout=1000)
+                                    frm = await page.get_attribute(f'input[name="fcText[{Matched_index}].specNum"]', 'value')
                                 except Exception:
                                     frm = ""
-                        self.sheet2[f"D{cur}"] = frm
+
+                        self.sheet2[f'D{r}'] = frm
                         try:
-                            self.sheet2.merge_cells(merge_cell_FC)
+                            self.sheet2.merge_cells(f'D{r}:L{r}')
                         except Exception:
                             pass
 
-                        # revised dates (two cells M and N)
-                        Rev_by = ""
-                        Rev_date = ""
+                        rev_by = ""
                         try:
-                            Rev_by = await page.locator(f'[name="fcText[{Matched_index}].revisedDatestr"]').input_value(timeout=1000)
+                            rev_by = await page.get_attribute(f'input[name="fcText[{Matched_index}].revisedDatestr"]', 'value')
                         except Exception:
-                            Rev_by = ""
-                        try:
-                            Rev_date = await page.locator(f'[name="fcText[{Matched_index}].revisedDatestr"]').input_value(timeout=1000)
-                        except Exception:
-                            Rev_date = ""
+                            try:
+                                rev_by = await page.get_attribute(f'input[name="fcText[{Matched_index}].revisedDatestr"]', 'value')
+                            except Exception:
+                                rev_by = ""
 
-                        self.sheet2[f"M{cur}"] = Rev_by
-                        self.sheet2[f"N{cur}"] = Rev_date
+                        self.sheet2[f'M{r}'] = rev_by
+                        self.sheet2[f'N{r}'] = rev_by
 
-                        # increment shared row
                         self.row_index += 1
+
                 Matched_index += 1
 
-            # -------------------------
-            # WY image check block
-            # Original: WY_exist = ["https://hehe.png","https://hihi.png"]
-            # Check element with id 'iw_img' and if src in WY_exist then click name 'bt_INDIRECTWY'
-            # -------------------------
-            WY_exist = ["https://hehe.png", "https://hihi.png"]
+            # Next: WY image check (original had WY_exist list)
             try:
-                img_locator = page.locator("#iw_img")
-                if await img_locator.count() > 0:
-                    WY_exist_img = await img_locator.get_attribute("src")
-                else:
-                    WY_exist_img = None
-            except Exception:
-                WY_exist_img = None
-
-            if WY_exist_img in WY_exist:
-                # click bt_INDIRECTWY (original code uses find_element(By.NAME,'bt_INDIRECTWY').click())
+                WY_exist = ["https://hehe.png", "https://hihi.png"]
+                img_src = ""
                 try:
-                    click_locator = page.locator('[name="bt_INDIRECTWY"]')
-                    if await click_locator.count() > 0:
-                        await click_locator.first.click(timeout=4000)
+                    img_src = await page.get_attribute('#iw_img', 'src')
                 except Exception:
-                    pass
+                    img_src = ""
+                await asyncio.sleep(0.2)
 
-                # small pause for UI rendering
-                try:
-                    await page.wait_for_timeout(1000)
-                except Exception:
-                    pass
-
-                # Write header row for Indirect/Direct table in sheet
-                async with self.workbook_lock:
-                    cur = self.row_index
-                    header_titles = ["Dir/Indir", "Indir Active", "JK", "Type", "MN/CN",
-                                     "MN/CN JK", "WY", "AW", "Okay used on", "Rev", "Derived", "B or C", "Revised"]
-                    for col_idx, title in enumerate(header_titles):
-                        col = string.ascii_uppercase[col_idx]  # 0->A, 1->B, ...
-                        self.sheet2[f"{col}{cur}"] = title
-                        # style
-                        self.sheet2[f"{col}{cur}"].fill = self.blue
-                        self.sheet2[f"{col}{cur}"].font = Font(color="FFFFFF", bold=True)
-                        self.sheet2[f"{col}{cur}"].border = self.Thin_border
-
-                    # merge M:N similar to original
+                if img_src in WY_exist:
+                    # click indirect button
                     try:
-                        self.sheet2.merge_cells(f"M{cur}:N{cur}")
+                        await page.click('button[name="bt_INDIRECTWY"]', timeout=3000)
                     except Exception:
-                        pass
+                        # try other selectors
+                        try:
+                            await page.click('[name="bt_INDIRECTWY"]')
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.4)
 
-                    # increment row
-                    self.row_index += 1
+                    async with self._wb_lock:
+                        r = self.row_index
+                        headers = ["Dir/Indir", "Indir Active", "JK", "Type", "MN/CN", "MN/CN JK",
+                                   "WY", "AW", "Okay used on", "Rev", "Derived", "B or C", "Revised"]
+                        for idx_h, val in enumerate(headers):
+                            col = string.ascii_uppercase[idx_h]
+                            self.sheet2[f'{col}{r}'] = val
+                            self.sheet2[f'{col}{r}'].fill = self.blue
+                            self.sheet2[f'{col}{r}'].font = Font(color="ffffff", bold=True)
+                            self.sheet2[f'{col}{r}'].border = self.Thin_border
 
-                # iterate indirect WY entries
-                WYS = ['1', '2', '5']
-                Matched_WY = 0
-                Matched_index = 0  # used to navigate list items by name indexing
-                # For robustness, attempt to loop until no more items or a safe cap
-                safe_cap = 200
-                entries_found = 0
-                while entries_found < safe_cap:
-                    # attempt to read value of name f'IndirectWYlist[{Matched_index}].wycode'
-                    try:
-                        wy_sel = f'[name="IndirectWYlist[{Matched_index}].wycode"]'
-                        if await page.locator(wy_sel).count() == 0:
-                            # attempt to click next page button similar to your code
-                            try:
-                                next_page_btn = page.locator('[name="bt_Page"]')
-                                if await next_page_btn.count() > 0:
-                                    # check if enabled: Playwright does not have is_enabled exactly but we can try click
-                                    try:
-                                        await next_page_btn.first.click(timeout=2000)
+                        # merge M:N
+                        try:
+                            self.sheet2.merge_cells(f'M{r}:N{r}')
+                        except Exception:
+                            pass
+
+                        self.row_index += 1
+
+                    # iterate WY list items (original used IndirectWYlist)
+                    Matched_WY = 0
+                    while True:
+                        try:
+                            # find WY id value
+                            wy_selector = f'input[name="IndirectWYlist[{Matched_WY}].wycode"]'
+                            wy_el = page.locator(wy_selector)
+                            if await wy_el.count() == 0:
+                                # maybe pagination or no more; try older next page button
+                                try:
+                                    next_page_btn = page.locator('[name="bt_Page"]')
+                                    if await next_page_btn.is_enabled():
+                                        await next_page_btn.click()
                                         Matched_WY = 0
-                                        Matched_index = 0
-                                        entries_found += 1
+                                        await asyncio.sleep(0.4)
                                         continue
-                                    except Exception:
+                                    else:
                                         break
-                                else:
+                                except Exception:
                                     break
-                            except Exception:
-                                break
-                        WY_id = await page.locator(wy_sel).input_value(timeout=2000)
-                    except Exception:
-                        break
 
-                    if str(WY_id) in WYS:
-                        # Direct/Indirect
-                        try:
-                            direct_val = await page.locator(f'[name="indirectList[{Matched_WY}].direct"]').input_value(timeout=1000)
+                            WY_id = await wy_el.first.get_attribute('value')
+                        except PlaywrightTimeoutError:
+                            break
                         except Exception:
-                            direct_val = ""
+                            break
 
-                        async with self.workbook_lock:
-                            cur = self.row_index
-                            self.sheet2[f"A{cur}"] = "Direct" if direct_val == "true" else "Indirect"
+                        # WYS codes considered
+                        WYS = ['1', '2', '5']
+                        if str(WY_id) in WYS:
+                            # collect many fields and write to sheet row
+                            async with self._wb_lock:
+                                r = self.row_index
+                                # Direct/Indirect
+                                try:
+                                    direct_val = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].direct"]', 'value')
+                                except Exception:
+                                    direct_val = ""
+                                if direct_val == "true":
+                                    self.sheet2[f'A{r}'] = "Direct"
+                                else:
+                                    self.sheet2[f'A{r}'] = "Indirect"
 
-                        # status
-                        try:
-                            Indirect_status = await page.locator(f'[name="indirectList[{Matched_WY}].status"]').input_value(timeout=1000)
-                        except Exception:
-                            Indirect_status = ""
-                        async with self.workbook_lock:
-                            if Indirect_status in ["A", "Active"]:
-                                self.sheet2[f"B{cur}"] = "Active"
-                                self.sheet2[f"B{cur}"].font = self.bold_font
+                                try:
+                                    status_val = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].status"]', 'value')
+                                    if status_val in ["A", "Active"]:
+                                        self.sheet2[f'B{r}'] = "Active"
+                                        # bold
+                                        self.sheet2[f'B{r}'].font = self.bold_font
+                                except Exception:
+                                    pass
 
-                        # New_JK
-                        try:
-                            New_JK = await page.locator(f'[name="indirectList[{Matched_index}].partNumber"]').input_value(timeout=1000)
-                        except Exception:
-                            New_JK = ""
-                        async with self.workbook_lock:
-                            self.sheet2[f"C{cur}"] = New_JK
-                            self.sheet2[f"C{cur}"].fill = self.green
+                                try:
+                                    new_jk = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].partNumber"]', 'value')
+                                except Exception:
+                                    new_jk = ""
+                                self.sheet2[f'C{r}'] = new_jk
+                                self.sheet2[f'C{r}'].fill = self.green
 
-                        # Type_name
-                        try:
-                            Type_name = await page.locator(f'[name="indirectList[{Matched_index}].typeName"]').input_value(timeout=1000)
-                        except Exception:
-                            Type_name = ""
-                        async with self.workbook_lock:
-                            self.sheet2[f"D{cur}"] = Type_name
+                                try:
+                                    type_name = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].typeName"]', 'value')
+                                except Exception:
+                                    type_name = ""
+                                self.sheet2[f'D{r}'] = type_name
 
-                        # MN/CN
-                        try:
-                            MN_CN = await page.locator(f'[name="indirectList[{Matched_index}].mncn"]').input_value(timeout=1000)
-                        except Exception:
-                            MN_CN = ""
-                        async with self.workbook_lock:
-                            if MN_CN:
-                                self.sheet2[f"E{cur}"] = MN_CN
+                                try:
+                                    mncn = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].mncn"]', 'value')
+                                    self.sheet2[f'E{r}'] = mncn
+                                except Exception:
+                                    pass
 
-                        # Old_JK
-                        try:
-                            Old_JK = await page.locator(f'[name="indirectList[{Matched_index}].oldiePArt"]').input_value(timeout=1000)
-                        except Exception:
-                            Old_JK = ""
-                        async with self.workbook_lock:
-                            self.sheet2[f"F{cur}"] = Old_JK
-                            # original code assigned fill=self.red incorrectly; we apply red fill
-                            self.sheet2[f"F{cur}"].fill = self.red
+                                try:
+                                    old_jk = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].oldiePArt"]', 'value')
+                                except Exception:
+                                    old_jk = ""
+                                self.sheet2[f'F{r}'] = old_jk
+                                # fill red if needed
+                                self.sheet2[f'F{r}'].fill = self.red
 
-                        # WY_type, Rework, applicable, Rev_EQ, Auth_Der, B_C, Rev_1, Rev2
-                        def safe_get(name_idx, field_name):
-                            sel = f'[name="indirectList[{name_idx}].{field_name}"]'
+                                try:
+                                    wy_type = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].wycode"]', 'value')
+                                except Exception:
+                                    wy_type = ""
+                                self.sheet2[f'G{r}'] = wy_type
+
+                                try:
+                                    rework = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].rework"]', 'value')
+                                except Exception:
+                                    rework = ""
+                                self.sheet2[f'H{r}'] = rework
+
+                                try:
+                                    applicable = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].app"]', 'value')
+                                except Exception:
+                                    applicable = ""
+                                self.sheet2[f'I{r}'] = applicable
+
+                                try:
+                                    rev_eq = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].eq"]', 'value')
+                                except Exception:
+                                    rev_eq = ""
+                                self.sheet2[f'J{r}'] = rev_eq
+
+                                try:
+                                    auth_der = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].authe"]', 'value')
+                                except Exception:
+                                    auth_der = ""
+                                self.sheet2[f'K{r}'] = auth_der
+
+                                try:
+                                    b_c = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].bc"]', 'value')
+                                except Exception:
+                                    b_c = ""
+                                self.sheet2[f'L{r}'] = b_c
+
+                                try:
+                                    rev1 = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].rev1"]', 'value')
+                                except Exception:
+                                    rev1 = ""
+                                self.sheet2[f'M{r}'] = rev1
+
+                                try:
+                                    rev2 = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].rev2"]', 'value')
+                                except Exception:
+                                    rev2 = ""
+                                self.sheet2[f'N{r}'] = rev2
+
+                                self.row_index += 1
+
+                                # Merge some cells and add extra note row as original did
+                                merge_left = f'A{self.row_index}:E{self.row_index}'
+                                merge_right = f'F{self.row_index}:K{self.row_index}'
+                                try:
+                                    self.sheet2.merge_cells(merge_left)
+                                    self.sheet2.merge_cells(merge_right)
+                                except Exception:
+                                    pass
+
+                                try:
+                                    change_reason = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].changeReason"]', 'value')
+                                except Exception:
+                                    change_reason = ""
+                                try:
+                                    self.sheet2[f'A{self.row_index}'] = change_reason
+                                except Exception:
+                                    pass
+
+                                try:
+                                    pd_note = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].pdcond"]', 'value')
+                                except Exception:
+                                    pd_note = ""
+                                try:
+                                    self.sheet2[f'F{self.row_index}'] = pd_note
+                                except Exception:
+                                    pass
+
+                                self.row_index += 1
+
+                        else:
+                            # Not in WYS, still attempt to read partNumber to keep New_JK variable for link-click fallback
                             try:
-                                return page.locator(sel).input_value(timeout=1000)
+                                new_jk = await page.get_attribute(f'input[name="indirectList[{Matched_WY}].partNumber"]', 'value')
                             except Exception:
-                                return ""
+                                new_jk = ""
+                        Matched_WY += 1
 
-                        WY_type = await safe_get(Matched_index, "wycode")
-                        Rework = await safe_get(Matched_index, "rework")
-                        applicable = await safe_get(Matched_index, "app")
-                        Rev_EQ = await safe_get(Matched_index, "eq")
-                        Auth_Der = await safe_get(Matched_index, "authe")
-                        B_C = await safe_get(Matched_index, "bc")
-                        Rev_1 = await safe_get(Matched_index, "rev1")
-                        Rev2 = await safe_get(Matched_index, "rev2")
-
-                        async with self.workbook_lock:
-                            self.sheet2[f"G{cur}"] = WY_type
-                            self.sheet2[f"H{cur}"] = Rework
-                            self.sheet2[f"I{cur}"] = applicable
-                            self.sheet2[f"J{cur}"] = Rev_EQ
-                            self.sheet2[f"K{cur}"] = Auth_Der
-                            self.sheet2[f"L{cur}"] = B_C
-                            self.sheet2[f"M{cur}"] = Rev_1
-                            self.sheet2[f"N{cur}"] = Rev2
-
-                        # increment row and write merged left/right and change reason & PD note (mirrors your code)
-                        async with self.workbook_lock:
-                            self.row_index += 1
-                            cur2 = self.row_index
-                            try:
-                                self.sheet2.merge_cells(f"A{cur2}:E{cur2}")
-                                self.sheet2.merge_cells(f"F{cur2}:K{cur2}")
-                            except Exception:
-                                pass
-
-                        # changeReason and pdcond
-                        try:
-                            change_reason = await page.locator(f'[name="indirectList[{Matched_index}].changeReason"]').input_value(timeout=1000)
-                        except Exception:
-                            change_reason = ""
-                        try:
-                            PD_note = await page.locator(f'[name="indirectList[{Matched_index}].pdcond"]').input_value(timeout=1000)
-                        except Exception:
-                            PD_note = ""
-
-                        async with self.workbook_lock:
-                            self.sheet2[f"A{cur2}"] = change_reason
-                            self.sheet2[f"F{cur2}"] = PD_note
-
-                        async with self.workbook_lock:
-                            self.row_index += 1
-
-                        # attempt to click link text named New_JK (original used driver.find_element(By.LINK_TEXT, f'{New_JK}').click())
-                        try:
-                            # Playwright: find anchor with exact text and click
-                            if New_JK:
-                                locator = page.locator(f'a:has-text("{New_JK}")')
-                                if await locator.count() > 0:
-                                    try:
-                                        await locator.first.click(timeout=3000)
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            pass
-
-                        entries_found += 1
-                    else:
-                        # not in WYS branch - still increment Matched_WY or Matched_index
-                        try:
-                            # attempt reading partNumber anyway
-                            _ = await page.locator(f'[name="indirectList[{Matched_index}].partNumber"]').input_value(timeout=1000)
-                        except Exception:
-                            pass
-
-                    Matched_WY += 1
-                    Matched_index += 1
-
-                # done processing WY section
-            # end WY_exist branch
-
-            # After full processing for this Part_no, save workbook periodically (under lock)
-            async with self.workbook_lock:
-                try:
-                    self.workbook.save(os.path.join(self.folder_path, self.filename))
-                except Exception:
+                    # After WY loop, try clicking the redirect link for New_JK if present
                     try:
-                        self.workbook.save(AUTOSAVE_PATH)
+                        if new_jk:
+                            # try link text click
+                            await page.click(f'a:has-text("{new_jk}")', timeout=2000)
                     except Exception:
-                        pass
+                        # fallback attempts similar to original
+                        try:
+                            await page.click('#Filed', timeout=2000)
+                        except Exception:
+                            pass
 
-            # close page for this worker
-            try:
-                await page.close()
-            except Exception:
-                pass
+            # close the page created for this part
+            await page.close()
 
-            return {"part": Part_no, "status": "OK"}
-        except Exception as e:
-            # ensure page closed on exceptions
-            try:
-                await page.close()
-            except Exception:
-                pass
-            print("Exception in worker for part", Part_no)
+        except Exception:
+            await page.close()
             traceback.print_exc()
-            return {"part": Part_no, "error": str(e)}
-        finally:
-            semaphore.release()
 
-    # -------------------------
-    # Public run (entry point)
-    # -------------------------
-    def run(self):
-        # Run Tkinter mainloop briefly to allow dialogs to appear then proceed
-        self.Basic()  # blocks until file selected and Part_nos loaded
-
-        # Run the async Playwright logic
-        asyncio.run(self.run_playwright_parallel())
-
-        # Keep the tkinter mainloop until user closes (preserve earlier run behavior)
-        # But we won't block forever — just show a message on completion.
+    def _finalize_and_save(self):
+        # Center align all cells and wrap text as original
         try:
-            messagebox.showinfo("Done", "Processing completed. Excel saved.")
+            for row in self.sheet2.iter_rows():
+                for cell in row:
+                    cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
         except Exception:
             pass
-        self.root.quit()
+
+        # Save workbook and open file (like original)
+        out_path = os.path.join(self.folder_path, self.filename)
+        self.workbook.save(out_path)
+        try:
+            os.startfile(out_path)
+        except Exception:
+            # fallback for platforms without os.startfile
+            print("Saved workbook to:", out_path)
+
+    # ---------- Public run flow ----------
+    def run(self):
+        # Ask user for Excel file (since original had a GUI file selection flow)
+        # For compatibility, we will ask user via file dialog if folder/filename not set
+        if not self.folder_path or not self.filename:
+            # Ask user to select file
+            file = filedialog.askopenfilename(title="Select PULSE Excel file", filetypes=[("Excel files", "*.xlsx;*.xlsm;*.xltx;*.xltm")])
+            if not file:
+                messagebox.showerror("No file", "No Excel file selected. Exiting.")
+                return
+            folder, fname = os.path.split(file)
+            self.open_workbook(folder, fname)
+        else:
+            self.open_workbook(self.folder_path, self.filename)
+
+        # Run Playwright tasks (async) and block until done
+        asyncio.run(self.run_playwright())
+
+        # Keep tkinter mainloop if you need the app UI (original had root.mainloop())
+        # We'll exit without showing GUI; if you want the GUI active, uncomment below:
+        # self.root.deiconify()
+        # self.root.mainloop()
 
 
 if __name__ == "__main__":
