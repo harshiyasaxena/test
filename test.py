@@ -1,84 +1,50 @@
-def build_PN_to_desc_iw_iwdesc(sheet):
-    PN_to_desc3 = {}
-    PN_iw_with_codes = set()
-    last_PN3 = None
-    pending_PN3 = None
+for row in self.sheet3.iter_rows(min_row=2):  # assuming header in row 1
+    part_no3 = str(row[0].value).strip() if row[0].value else None
+    dsi3 = str(row[10].value).strip() if row[10].value else None  # DSI column
+    nomen3 = str(row[11].value).strip() if row[11].value else None  # description column
 
-    for row in sheet.iter_rows(min_row=1):
-        a_val = str(row[0].value).strip() if row[0].value else None
-        if not a_val:
-            continue
+    if not part_no3 or not dsi3 or dsi3.upper() != "QD":
+        continue
 
-        # detect new PN block
-        if a_val.upper() == "PN":
-            pending_PN3 = True
-            continue
+    # ---- Check if this PN exists in Sheet2 mapping ----
+    if part_no3 not in PN_to_desc3:
+        continue
 
-        # capture the PN value after "PN"
-        if pending_PN3:
-            last_PN3 = a_val
-            pending_PN3 = False
-            continue
+    desc_list = PN_to_desc3[part_no3]
+    if not isinstance(desc_list, list):
+        desc_list = [desc_list]
 
-        # locate "Direct/Indirect" section
-        if a_val.upper() == "DIRECT/ INDIRECT" and last_PN3:
-            ws = row[0].parent
+    # ---- Get all QD rows in Sheet3 for this PN ----
+    qd_rows_for_pn = [
+        r for r in self.sheet3.iter_rows(min_row=2)
+        if str(r[0].value).strip() == part_no3 and str(r[10].value).strip().upper() == "QD"
+    ]
 
-            # find "IW" column in this row
-            for cell in row:
-                if not (cell.value and str(cell.value).strip().upper() == "IW"):
-                    continue
+    # ---- Strict count match check ----
+    if len(qd_rows_for_pn) != len(desc_list):
+        # Mark the PN cell red
+        pn_cell = row[0]
+        pn_cell.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+        # Add an error comment
+        add_error_comment_to_PN_cell(
+            self.sheet3,
+            part_no3,
+            text=f"QD count mismatch: Sheet2 has {len(desc_list)} desc, Sheet3 has {len(qd_rows_for_pn)} QD rows"
+        )
+        # Skip matching for this PN altogether
+        continue
 
-                iw_col = cell.column
-                v_row = cell.row + 1  # start scanning below IW
-                max_row = ws.max_row
-
-                # iterate until next PN block begins
-                while v_row <= max_row:
-                    first_col_val = (
-                        str(ws.cell(row=v_row, column=1).value).strip()
-                        if ws.cell(row=v_row, column=1).value
-                        else ""
-                    )
-
-                    # stop when new PN section starts
-                    if first_col_val and first_col_val.upper() == "PN":
-                        break
-
-                    val_cell = ws.cell(row=v_row, column=iw_col)
-                    if not val_cell.value:
-                        v_row += 1
-                        continue
-
-                    code_val = str(val_cell.value).strip()
-
-                    # skip standard IW codes (1 or 2)
-                    if code_val in ("1", "2"):
-                        v_row += 1
-                        continue
-
-                    # record this PN as having IW codes (non-1/2)
-                    PN_iw_with_codes.add(last_PN3)
-
-                    # get next row (expected description)
-                    desc_row = v_row + 1
-                    if desc_row > max_row:
-                        v_row += 2
-                        continue
-
-                    # read description from columns F–K
-                    desc_parts = []
-                    for c in range(6, 12):
-                        v = ws.cell(row=desc_row, column=c).value
-                        if v and str(v).strip():
-                            desc_parts.append(str(v).strip())
-
-                    desc_text = " ".join(desc_parts).strip()
-                    if desc_text:
-                        PN_to_desc3.setdefault(last_PN3, []).append(desc_text)
-                        print(f"Mapped PN '{last_PN3}' -> '{desc_text}' (IW code: {code_val})")
-
-                    # move 2 rows forward (skip desc row)
-                    v_row = desc_row + 1
-
-    return PN_to_desc3, PN_iw_with_codes
+    # ---- If counts match, compare each QD vs IW description ----
+    for qd_row, desc_text in zip(qd_rows_for_pn, desc_list):
+        nomen3 = str(qd_row[11].value).strip() if qd_row[11].value else ""
+        if normalize_PN(nomen3) == normalize_PN(desc_text):
+            qd_row[11].fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+            qd_row[12].fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+        else:
+            qd_row[11].fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+            qd_row[12].fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+            add_error_comment_to_PN_cell(
+                self.sheet3,
+                part_no3,
+                text=f"QD description mismatch for PN {part_no3}: expected '{desc_text}'"
+            )
