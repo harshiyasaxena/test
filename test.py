@@ -1,32 +1,106 @@
-if dsi3 and dsi3.upper() == "QD" and part_no3 in PN_to_desc3:
-    desc_list = PN_to_desc3[part_no3]
-    if not isinstance(desc_list, list):
-        desc_list = [desc_list]
+def show_options_dialog(self):
+    dlg = tk.Toplevel(self.root)
+    dlg.title("Options")
+    dlg.grab_set()
 
-    # 🔹 NEW: get all QD rows for this PN in sheet3
-    qd_rows_for_pn = [
-        r for r in self.sheet3.iter_rows(min_row=2)
-        if str(r[0].value).strip() == part_no3 and str(r[10].value).strip().upper() == "QD"
-    ]
+    # state holders
+    self.fig_file = None
+    self.epl_folder = None
+    self.future1_folder = None
+    self.future2_folder = None
 
-    # 🔹 NEW: check if counts match
-    if len(qd_rows_for_pn) != len(desc_list):
-        # mark only the PN cell red + add comment
-        row[0].fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-        add_error_comment_to_PN_cell(
-            self.sheet3,
-            part_no3,
-            text=f"QD count mismatch: Sheet2 has {len(desc_list)} desc, Sheet3 has {len(qd_rows_for_pn)} QD rows"
+    # BUTTON FUNCTIONS
+    def pick_fig():
+        path = filedialog.askopenfilename(
+            title="Select Figure PDF", filetypes=[("PDF files", "*.pdf")]
         )
-        continue  # skip further comparison
+        if path:
+            self.fig_file = path
+            btn1.config(text=f"FIG Selected")
 
-    # (existing matching logic below stays same)
-    match_found = any(normalize_PN(nomen3) == normalize_PN(desc) for desc in desc_list)
+    def pick_epl():
+        path = filedialog.askdirectory(title="Select EPL Folder")
+        if path:
+            self.epl_folder = path
+            btn2.config(text="EPL Selected")
 
-    if match_found:
-        row[11].fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
-        row[12].fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
-    else:
-        row[11].fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-        row[12].fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-        add_error_comment_to_PN_cell(self.sheet3, part_no3, text="QD description unmatched")
+    def pick_future1():
+        path = filedialog.askdirectory(title="Select Folder")
+        if path:
+            self.future1_folder = path
+            btn3.config(text="Future1 Selected")
+
+    def pick_future2():
+        path = filedialog.askdirectory(title="Select Folder")
+        if path:
+            self.future2_folder = path
+            btn4.config(text="Future2 Selected")
+
+    # UI layout
+    frm = tk.Frame(dlg)
+    frm.pack(padx=10, pady=10)
+
+    btn1 = tk.Button(frm, text="Import Figure Content", width=25, command=pick_fig)
+    btn1.grid(row=0, column=0, padx=5, pady=5)
+
+    btn2 = tk.Button(frm, text="Import EPL", width=25, command=pick_epl)
+    btn2.grid(row=1, column=0, padx=5, pady=5)
+
+    btn3 = tk.Button(frm, text="Future", width=25, command=pick_future1)
+    btn3.grid(row=2, column=0, padx=5, pady=5)
+
+    btn4 = tk.Button(frm, text="Future", width=25, command=pick_future2)
+    btn4.grid(row=3, column=0, padx=5, pady=5)
+
+    # RUN BUTTON
+    def on_run():
+        dlg.grab_release()
+        dlg.destroy()
+
+        self.start_timer()
+
+        # ---- Run FIGURE ----
+        if self.fig_file:
+            try:
+                out = os.path.splitext(self.fig_file)[0] + ".xlsx"
+                pdf_to_excel(self.fig_file, out)
+                self.excel_file = out
+                self.folder_path = os.path.dirname(out)
+                self.filename = os.path.basename(out)
+
+                if hasattr(self, "Basic"):
+                    self.Basic()
+                if hasattr(self, "main_code"):
+                    self.main_code()
+
+            except Exception as e:
+                messagebox.showerror("Figure Error", f"{e}")
+
+        # ---- Run EPL ----
+        if self.epl_folder:
+            try:
+                self.folder_path = self.epl_folder
+                self.browse_and_EPL()   # already does the job
+            except Exception as e:
+                messagebox.showerror("EPL Error", f"{e}")
+
+        # ---- Future actions (do nothing for now) ----
+        if self.future1_folder:
+            print("Future Task 1 placeholder")
+
+        if self.future2_folder:
+            print("Future Task 2 placeholder")
+
+        self.exit_app()
+
+    run_btn = tk.Button(frm, text="RUN", width=15, bg="green", fg="white", command=on_run)
+    run_btn.grid(row=0, column=1, rowspan=4, padx=15)
+
+    # CANCEL BUTTON
+    def on_cancel():
+        dlg.grab_release()
+        dlg.destroy()
+        self.exit_app()
+
+    cancel_btn = tk.Button(dlg, text="Cancel", command=on_cancel)
+    cancel_btn.pack(pady=5)
