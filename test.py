@@ -1,106 +1,92 @@
-def show_options_dialog(self):
-    dlg = tk.Toplevel(self.root)
-    dlg.title("Options")
-    dlg.grab_set()
+def extract_pn_from_L(value):
+    if not value:
+        return None
+    parts = str(value).strip().split()
+    if len(parts) < 2:
+        return None
+    return parts[-1].strip()  # last token is always PN
 
-    # state holders
-    self.fig_file = None
-    self.epl_folder = None
-    self.future1_folder = None
-    self.future2_folder = None
+def get_child_PN_for_IW1(sheet2, parent_pn):
+    ws = sheet2
+    pending = False
+    last_pn = None
+    in_direct = False
+    DI_header = None
+    PN_col = None
+    IW_col = None
 
-    # BUTTON FUNCTIONS
-    def pick_fig():
-        path = filedialog.askopenfilename(
-            title="Select Figure PDF", filetypes=[("PDF files", "*.pdf")]
+    for row in ws.iter_rows(min_row=1):
+        first = str(row[0].value).strip() if row[0].value else None
+
+        if first == "PN":
+            pending = True
+            continue
+
+        if pending:
+            last_pn = first
+            pending = False
+            continue
+
+        if last_pn != parent_pn:
+            continue
+
+        if first and first.lower() == "direct/indirect":
+            in_direct = True
+            DI_header = row
+            continue
+
+        if in_direct:
+            if PN_col is None or IW_col is None:
+                # detect PN and IW columns
+                for idx, c in enumerate(DI_header):
+                    val = str(c.value).strip() if c.value else None
+                    if val == "PN" and PN_col is None:
+                        PN_col = idx
+                    if val == "IW" and IW_col is None:
+                        IW_col = idx
+
+            # next parent block detected -> stop
+            if first == "PN":
+                return None
+
+            iw_cell = row[IW_col].value if IW_col is not None else None
+            try:
+                iw_val = int(float(str(iw_cell).strip()))
+            except:
+                iw_val = None
+
+            if iw_val == 1:
+                child = row[PN_col].value
+                return str(child).strip() if child else None
+
+    return None
+
+
+if dsi_val and dsi_val.upper() in ("MU", "MN"):
+
+    # Ignore T == D case
+    if t_val == "D":
+        for cell in row:
+            cell.fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+        continue
+
+    # Extract PN from column L
+    extracted = extract_pn_from_L(row[11].value)
+
+    # Get expected PN from sheet2 (IW=1)
+    expected = get_child_PN_for_IW1(self.sheet2, part_no4)
+
+    # Compare
+    if extracted and expected and normalize_PN(extracted) == normalize_PN(expected):
+        for cell in row:
+            cell.fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+    else:
+        for cell in row:
+            cell.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+        add_error_comment_to_PN_cell(
+            self.sheet3,
+            part_no4,
+            f"MU mismatch: Expected {expected}, Found {extracted}"
         )
-        if path:
-            self.fig_file = path
-            btn1.config(text=f"FIG Selected")
 
-    def pick_epl():
-        path = filedialog.askdirectory(title="Select EPL Folder")
-        if path:
-            self.epl_folder = path
-            btn2.config(text="EPL Selected")
-
-    def pick_future1():
-        path = filedialog.askdirectory(title="Select Folder")
-        if path:
-            self.future1_folder = path
-            btn3.config(text="Future1 Selected")
-
-    def pick_future2():
-        path = filedialog.askdirectory(title="Select Folder")
-        if path:
-            self.future2_folder = path
-            btn4.config(text="Future2 Selected")
-
-    # UI layout
-    frm = tk.Frame(dlg)
-    frm.pack(padx=10, pady=10)
-
-    btn1 = tk.Button(frm, text="Import Figure Content", width=25, command=pick_fig)
-    btn1.grid(row=0, column=0, padx=5, pady=5)
-
-    btn2 = tk.Button(frm, text="Import EPL", width=25, command=pick_epl)
-    btn2.grid(row=1, column=0, padx=5, pady=5)
-
-    btn3 = tk.Button(frm, text="Future", width=25, command=pick_future1)
-    btn3.grid(row=2, column=0, padx=5, pady=5)
-
-    btn4 = tk.Button(frm, text="Future", width=25, command=pick_future2)
-    btn4.grid(row=3, column=0, padx=5, pady=5)
-
-    # RUN BUTTON
-    def on_run():
-        dlg.grab_release()
-        dlg.destroy()
-
-        self.start_timer()
-
-        # ---- Run FIGURE ----
-        if self.fig_file:
-            try:
-                out = os.path.splitext(self.fig_file)[0] + ".xlsx"
-                pdf_to_excel(self.fig_file, out)
-                self.excel_file = out
-                self.folder_path = os.path.dirname(out)
-                self.filename = os.path.basename(out)
-
-                if hasattr(self, "Basic"):
-                    self.Basic()
-                if hasattr(self, "main_code"):
-                    self.main_code()
-
-            except Exception as e:
-                messagebox.showerror("Figure Error", f"{e}")
-
-        # ---- Run EPL ----
-        if self.epl_folder:
-            try:
-                self.folder_path = self.epl_folder
-                self.browse_and_EPL()   # already does the job
-            except Exception as e:
-                messagebox.showerror("EPL Error", f"{e}")
-
-        # ---- Future actions (do nothing for now) ----
-        if self.future1_folder:
-            print("Future Task 1 placeholder")
-
-        if self.future2_folder:
-            print("Future Task 2 placeholder")
-
-        self.exit_app()
-
-    run_btn = tk.Button(frm, text="RUN", width=15, bg="green", fg="white", command=on_run)
-    run_btn.grid(row=0, column=1, rowspan=4, padx=15)
-
-    # CANCEL BUTTON
-    def on_cancel():
-        dlg.grab_release()
-        dlg.destroy()
-        self.exit_app()
-
-    cancel_btn = tk.Button(dlg, text="Cancel", command=on_cancel)
-    cancel_btn.pack(pady=5)
+    continue
