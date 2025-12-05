@@ -1,162 +1,157 @@
-import os
-import sys
-import time
-import tkinter as tk
-from tkinter import ttk, messagebox
-import win32com.client
-from playwright.sync_api import sync_playwright
-from openpyxl import load_workbook
+def get_child_PN_for_IW1(sheet2, parent_pn):
+    """
+    For a given parent_pn (from sheet3 col J), go to sheet2 and:
+      - find the PN block whose PN matches parent_pn (using normalize_PN)
+      - inside its 'Direct/Indirect' section, find the row containing header 'IW'
+      - then scan all rows below it, until next 'PN' block starts
+      - for every row where IW == 1, collect:
+            MU candidates  -> value under 'PN'
+            MN candidates  -> value under 'RP/NP PN'
+    Return (mu_list, mn_list)
+    """
+    ws = sheet2
 
-def on_button_click():
-    dropdown1_value = dropdown1.get()
-    dropdown2_value = dropdown2.get()
-    dropdown3_value = dropdown3.get()
+    def norm_pn(x):
+        if x is None:
+            return None
+        s = str(x).strip()
+        if s.upper().startswith("IR"):
+            s = s[2:].strip()
+        return s.upper()
 
-    if not dropdown1_value or not dropdown2_value or not dropdown3_value:
-        messagebox.showwarning("Input Error", "Dropdowns cannot be blank")
-        return
+    pending = False
+    last_pn = None
+    in_direct = False
+    DI_header = None
+    PN_col = None
+    RPNP_col = None
+    IW_col = None
 
-    if dropdown2_value == dropdown3_value:
-        messagebox.showwarning("Input Error", "Status cannot be same")
-        return
+    mu_list = []
+    mn_list = []
 
-    Main_code(dropdown1_value, dropdown2_value, dropdown3_value)
+    for row in ws.iter_rows(min_row=1):
+        first = str(row[0].value).strip() if row[0].value else None
 
+        # --- Detect new PN block header in column A ---
+        if first and first.upper() == "PN":
+            # if we were already inside desired parent block and have collected something, we can stop
+            if last_pn and norm_pn(last_pn) == norm_pn(parent_pn) and (mu_list or mn_list):
+                break
 
-def Main_code(dropdown1_value, dropdown2_value, dropdown3_value):
+            pending = True
+            in_direct = False     # reset for next block
+            DI_header = None
+            PN_col = RPNP_col = IW_col = None
+            continue
 
-    folder_path = r"C:\Planner_Queue_Status_Update"
-    file_path = os.path.join(folder_path, "Planner_Queue_Status_Update.xlsx")
+        # --- The row immediately after "PN" is the part number itself ---
+        if pending:
+            last_pn = first
+            pending = False
+            continue
 
-    if not os.path.isdir(folder_path):
-        messagebox.showerror("Error", f"Folder not found: {folder_path}")
-        sys.exit()
+        # If we are not in the block of the desired parent_pn, skip
+        if not last_pn or norm_pn(last_pn) != norm_pn(parent_pn):
+            continue
 
-    if not os.path.exists(file_path):
-        messagebox.showerror("Error", f"File not found: {file_path}")
-        sys.exit()
+        # --- Enter Direct/Indirect header row ---
+        if first and first.lower() == "direct/indirect":
+            in_direct = True
+            DI_header = row
+            PN_col = RPNP_col = IW_col = None
+            continue
 
-    # Close Excel if open
-    excel = win32com.client.Dispatch("Excel.Application")
-    for workbook in excel.Workbooks:
-        if workbook.Name == "Planner_Queue_Status_Update.xlsx":
-            workbook.Close(SaveChanges=False)
-            break
+        # --- Inside Direct/Indirect section ---
+        if in_direct:
+            # If we encounter a new PN block while in Direct/Indirect, we are done
+            if first and first.upper() == "PN":
+                break
 
-    workbook = load_workbook(file_path)
+            # Detect the column indices once from DI_header row (0-based indices for 'row[...]')
+            if PN_col is None or IW_col is None:
+                for idx, c in enumerate(DI_header):
+                    val = str(c.value).strip() if c.value else None
+                    if val == "PN":
+                        PN_col = idx
+                    elif val == "IW":
+                        IW_col = idx
+                    elif val == "RP/NP PN":
+                        RPNP_col = idx
 
-    # Reset report sheet
-    if "Planner Queue Report" in workbook.sheetnames:
-        workbook.remove(workbook["Planner Queue Report"])
-    sheet2 = workbook.create_sheet("Planner Queue Report")
-    sheet1 = workbook["INPUTS"]
+            if IW_col is None:
+                continue
 
-    Part_nos = [row.value for row in sheet1["A"] if row.value is not None]
+            # Read IW value in this row
+            iw_raw = row[IW_col].value
+            try:
+                iw_val = int(float(str(iw_raw).strip()))
+            except Exception:
+                iw_val = None
 
-    if not Part_nos:
-        messagebox.showerror("Error", "No part numbers found in INPUTS column A")
-        sys.exit()
+            # Only care about rows where IW == 1
+            if iw_val == 1:
+                if PN_col is not None:
+                    pn_val = row[PN_col].value
+                    if pn_val:
+                        mu_list.append(str(pn_val).strip())
 
-    report_index = 1
+                if RPNP_col is not None:
+                    mn_val = row[RPNP_col].value
+                    if mn_val:
+                        mn_list.append(str(mn_val).strip())
 
-    # PLAYWRIGHT STARTS
-    with sync_playwright() as p:
-        browser = p.firefox.launch(headless=False)
-        page = browser.new_page()
-
-        page.goto("https://hehe.pl")
-
-        # Click Continue button
-        page.click("input[value='Continue']")
-
-        # Menu Selection
-        try:
-            page.wait_for_selector("#oCMenu_top2_0", timeout=30000)
-            page.click("#oCMenu_top2_0")
-        except:
-            pass
-
-        page.click("#oCMenu_sub112")
-
-        # Dropdown values
-        page.select_option("#model", label=dropdown1_value)
-        page.select_option("#status", label=dropdown2_value)
-
-        for Part_no in Part_nos:
-            page.fill("input[name='partNumber']", str(Part_no))
-            page.keyboard.press("Enter")
-            time.sleep(1)
-
-            index = 0
-            while True:
-                selector = f"select[name='plannerQList[{index}].status']"
-                if not page.query_selector(selector):
-                    if index == 0:
-                        sheet2[f"A{report_index}"] = f"{Part_no} does not exist in Status -> {dropdown2_value}"
-                        report_index += 1
-                    break
-
-                try:
-                    page.select_option(selector, label=dropdown3_value)
-                    page.click("#bt_Save")
-                    sheet2[f"A{report_index}"] = f"{Part_no} -> Status changed to {dropdown3_value}"
-                    report_index += 1
-                except:
-                    sheet2[f"A{report_index}"] = f"Unable to change status for {Part_no}"
-                    report_index += 1
-
-                index += 1
-
-        browser.close()
-
-    workbook.save(file_path)
-    os.startfile(file_path)
-    messagebox.showinfo("SUCCESS", "Automation completed successfully")
+    return mu_list, mn_list
 
 
-# GUI
-root = tk.Tk()
-root.title("Planner_Queue_Status_Update")
+        if dsi_val and dsi_val.upper() in ("MU", "MN"):
+            # Get all MU/MN candidates (for IW == 1) from sheet2, for this parent PN
+            mu_list, mn_list = get_child_PN_for_IW1(self.sheet2, part_no4)
 
-label_banner = tk.Label(root, text="Planner Queue Status Update",
-                        font=("Helvetica", 20, "bold"),
-                        bg="#4A90E2", fg="white",
-                        pady=20, padx=40)
-label_banner.grid(row=0, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
+            extracted_L = extract_last_token(row[11].value)
+            norm_token = normalize_PN(extracted_L)
 
-style = ttk.Style()
-style.configure("TCombobox", font=("Helvetica", 20), padding=5)
+            norm_mu_set = {normalize_PN(x) for x in mu_list if x}
+            norm_mn_set = {normalize_PN(x) for x in mn_list if x}
 
-label1 = tk.Label(root, text="Select Model:", font=("Helvetica", 15, "bold"))
-label1.grid(row=1, column=0, padx=10, pady=10)
+            # --- MU: check against any PN with IW=1 ---
+            if dsi_val.upper() == "MU":
+                if norm_token not in norm_mu_set:
+                    for cell in row:
+                        cell.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+                    add_error_comment_to_PN_cell(self.sheet3, part_no4, "MU part no mismatch")
+                    continue
 
-label2 = tk.Label(root, text="Change Status From:", font=("Helvetica", 15, "bold"))
-label2.grid(row=2, column=0, padx=10, pady=10)
+            # --- MN: check against any RP/NP PN with IW=1 ---
+            if dsi_val.upper() == "MN":
+                if norm_token not in norm_mn_set:
+                    for cell in row:
+                        cell.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+                    add_error_comment_to_PN_cell(self.sheet3, part_no4, "MN part no mismatch")
+                    continue
 
-label3 = tk.Label(root, text="Change Status To:", font=("Helvetica", 15, "bold"))
-label3.grid(row=3, column=0, padx=10, pady=10)
+            # If MU/MN token matched, then apply your IW_val logic as before:
+            if IW_val != 1:
+                if check_in_direct_indirect_PN(self.sheet2, part_no4):
+                    for cell in row:
+                        cell.fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+                    continue
 
-dropdown1_values = ["", "A", "B", "C"]
-dropdown1 = ttk.Combobox(root, values=dropdown1_values)
-dropdown1.grid(row=1, column=1, padx=10, pady=10)
-
-dropdown2_values = ["", "New", "Open"]
-dropdown2 = ttk.Combobox(root, values=dropdown2_values)
-dropdown2.grid(row=2, column=1, padx=10, pady=10)
-
-dropdown3_values_map = {"New": ["New", "In work"]}
-
-dropdown3 = ttk.Combobox(root)
-dropdown3.grid(row=3, column=1, padx=10, pady=10)
-
-def update_dropdown3(event):
-    selected_status = dropdown2.get()
-    dropdown3["values"] = dropdown3_values_map.get(selected_status, [])
-    dropdown3.set("")
-
-dropdown2.bind("<<ComboboxSelected>>", update_dropdown3)
-
-button = tk.Button(root, text="Submit", command=on_button_click, font=("Helvetica", 12, "bold"))
-button.grid(row=4, column=0, columnspan=2, pady=10)
-
-root.mainloop()
+                if t_val == "D":
+                    for cell in row:
+                        cell.fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+                else:
+                    PN_row_t = PN_to_sheet3_t.get(part_no4)
+                    if PN_row_t == "D":
+                        for cell in row:
+                            cell.fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+                    else:
+                        for cell in row:
+                            cell.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+                        if row[9].value:
+                            add_error_comment_to_PN_cell(self.sheet3, part_no4, text="MU/MN rule violation")
+            else:
+                # IW_val == 1, everything OK
+                for cell in row:
+                    cell.fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+            
