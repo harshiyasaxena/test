@@ -1,0 +1,167 @@
+Thanks — I looked through your (huge) script and I see the root cause and an easy, safe fix.
+
+### What's happening (short)
+
+Your code determines that a Part-No is “missing” a particular DSI (e.g. `PF`) by checking a `PN_has_*` set that was built from `sheet3`. But when you mark rows red you mark **all occurrences** of that Part No in the sheet immediately — even if *some other occurrence later in the sheet* actually contains the expected DSI. In short: you mark before checking *all* occurrences for that Part No.
+
+### The rule you want
+
+Only mark a Part No as missing if **none** of its occurrences in `sheet3` have the expected DSI. Conversely, if any occurrence has the expected DSI, don't mark other occurrences as missing — instead only validate (red/green) the rows that actually have that DSI.
+
+---
+
+### What to change
+
+Replace your current `mark_missing_PN_red_for_desc` and `compare_and_color` logic with these two functions (they check *all* occurrences first and then mark rows accordingly). Then call them the same places you currently call the older functions.
+
+> Where to replace: in `main_code()` — remove (or overwrite) the definitions of `mark_missing_PN_red_for_desc` and `compare_and_color` that already exist, and paste the following implementations instead. Then keep your existing calls but change the call to `mark_missing_PN_red_for_desc()` to pass the `expected_dsi` list (examples below).
+
+```python
+# Replace existing function with this implementation
+def mark_missing_PN_red_for_desc(PN_set, expected_dsi_list, sheet3, error_msg, normalize_fn=normalize_PN):
+    """
+    PN_set: iterable of PN values that we expect (keys from PN_to_desc)
+    expected_dsi_list: list or set of DSI strings we expect for these PNs (e.g. ["PF"])
+    sheet3: worksheet 'Report Data'
+    """
+    red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+
+    # Build map: normalized_part -> set of DSIs present anywhere for that part
+    part_dsis = {}
+    for row in sheet3.iter_rows(min_row=2):
+        part_cell = row[9].value  # Part No column (index 9 in your code)
+        dsi_cell = row[12].value  # DSI column (index 12 in your code)
+        if part_cell:
+            p = normalize_fn(part_cell)
+            dsi = (str(dsi_cell).strip().upper() if dsi_cell else "")
+            part_dsis.setdefault(p, set()).add(dsi)
+
+    expected_dsis_upper = {s.strip().upper() for s in expected_dsi_list}
+
+    # For each PN we expect, check if ANY occurrence has any of expected DSIs.
+    for PN_val in PN_set:
+        norm_PN = normalize_fn(PN_val)
+        dsis_for_part = part_dsis.get(norm_PN, set())
+        found_match = any(d in dsis_for_part for d in expected_dsis_upper if d)
+
+        if not found_match:
+            # No occurrence had the expected DSI -> mark all rows for that PN red and add comment
+            for row in sheet3.iter_rows(min_row=2):
+                cell_part = row[9].value
+                if not cell_part:
+                    continue
+                if normalize_fn(cell_part) == norm_PN:
+                    # color the Part No cell red and add comment
+                    row[9].fill = red_fill
+                    add_error_comment_to_PN_cell(sheet3, PN_val, error_msg)
+```
+
+And replace `compare_and_color` with the following (this function now colors **only** the rows that have the DSI in question; it also uses the PN_to_desc mapping to compare nomen vs expected desc for rows having the DSI):
+
+```python
+def compare_and_color(sheet3, PN_to_desc, dsi_match, error_msg_unmatched, normalize_fn=normalize_PN):
+    """
+    For each row in sheet3: if the row's DSI == dsi_match and the Part No exists in PN_to_desc,
+    compare nomen vs expected description and color that row green or red accordingly.
+    Do NOT mark other occurrences of the same Part No that don't carry the dsi_match.
+    """
+    green_fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+    red_fill   = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+
+    dsi_match_up = dsi_match.strip().upper()
+
+    # iterate rows and handle only rows whose DSI equals the desired DSI
+    last_part_no = None
+    for row in sheet3.iter_rows(min_row=2):
+        if row[9].value:
+            last_part_no = normalize_fn(row[9].value)
+        if not last_part_no:
+            continue
+
+        # get this row's DSI and nomen
+        dsi_val = (str(row[12].value).strip().upper() if row[12].value else "")
+        if dsi_val != dsi_match_up:
+            # this row doesn't carry the DSI we're checking — skip coloring here
+            continue
+
+        # lookup expected description for this PN (PN_to_desc keys are in sheet2 format)
+        expected_desc = PN_to_desc.get(last_part_no) or PN_to_desc.get(row[9].value) or None
+        nomen_val = (str(row[11].value).strip() if row[11].value else "")
+
+        if expected_desc is None:
+            # no expected description found for this PN — mark row red and comment
+            for cell in row:
+                cell.fill = red_fill
+            add_error_comment_to_PN_cell(sheet3, row[9].value, f"No expected description found for DSI {dsi_match}")
+            continue
+
+        # normalize both sides depending on DSI type (you used different logic earlier)
+        if dsi_match_up in ("PF", "MD", "QDQ"):
+            left = normalize(nomen_val)
+            right = normalize(expected_desc)
+        else:
+            left = normalize_PN(nomen_val)
+            right = normalize_PN(expected_desc)
+
+        if left == right:
+            # match -> color only the two relevant cells (Nomenclature & DSI) green
+            try:
+                row[11].fill = green_fill
+                row[12].fill = green_fill
+            except Exception:
+                pass
+        else:
+            try:
+                row[11].fill = red_fill
+                row[12].fill = red_fill
+            except Exception:
+                pass
+            add_error_comment_to_PN_cell(sheet3, row[9].value, error_msg_unmatched)
+```
+
+---
+
+### How to call them (examples)
+
+Replace the spots where you currently do:
+
+```python
+PN_to_desc = build_PN_desc(self.sheet2,"PN","PF","PF",slice(3,12))
+PN_has_PF_in_sheet3 = build_PN_has_dsi(self.sheet3,["PF"])
+mark_missing_PN_red_for_desc(PN_to_desc, PN_has_PF_in_sheet3, self.sheet3,"Missing PF in FCR",normalize_PN)
+compare_and_color(self.sheet3,PN_to_desc,"PF","PF description unmatched",normalize_PN)
+```
+
+with:
+
+```python
+PN_to_desc = build_PN_desc(self.sheet2,"PN","PF","PF",slice(3,12))
+# call the new function: pass expected_dsi_list instead of PN_has set
+mark_missing_PN_red_for_desc(PN_to_desc, ["PF"], self.sheet3, "Missing PF in FCR", normalize_PN)
+compare_and_color(self.sheet3, PN_to_desc, "PF", "PF description unmatched", normalize_PN)
+```
+
+And do the same for `"MD"`, `"SD"`, `"QD"`, etc — pass the expected DSI string list into `mark_missing_PN_red_for_desc`.
+
+---
+
+### Why this fixes your specific symptom
+
+The new `mark_missing_PN_red_for_desc` first scans the whole `sheet3` and determines whether **any** occurrence of a Part No has the expected DSI. Only when **none** of its occurrences do, it marks all rows for that Part No as missing. That prevents the earlier behavior of marking the first occurrence red even though a later occurrence has the correct DSI.
+
+`compare_and_color` now only validates rows that actually carry the relevant DSI — it will color the row green if the nomenclature matches the expected description, otherwise red and attach a comment — but it will not blindly color other occurrences that do not carry that DSI.
+
+---
+
+### A couple of extra suggestions
+
+1. Keep all normalization in one place (`normalize_PN`) and use it consistently as I did above.
+2. If your sheet has trailing spaces / mixed cases, always call `normalize_PN` before dictionary lookups.
+3. You have several typos in the original code (for example `rpw[3]` maybe meant `row[3]`) — if you see NameErrors fix those. The change above focuses on the logic you asked about.
+
+---
+
+If you want I can:
+
+* paste a ready-made patch showing the exact lines to replace in your file (I can search and replace the function names and show the final code for `main_code()`), or
+* run a small unit-test simulation (I can create a small `openpyxl` workbook with your sample structure and show the before/after coloring) — tell me which you prefer and I’ll produce it right away.
