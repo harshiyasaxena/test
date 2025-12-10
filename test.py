@@ -102,3 +102,88 @@ for row in self.sheet3.iter_rows(min_row=2):
         block_counter[pn] = block_counter.get(pn, 0) + 1
         current_block = block_counter[pn] - 1
     PN_block_map.append(current_block)
+
+
+def compare_and_color(sheet3, PN_to_desc, dsi_match,
+                      error_msg_unmatched, normalize_fn, block_map):
+    last_part_no = None
+    parent_t_val = None
+
+    for idx, row in enumerate(sheet3.iter_rows(min_row=2)):
+
+        # Detect new block
+        if row[9].value:
+            last_part_no = normalize_fn(row[9].value)
+            parent_t_val = (str(row[3].value).strip()
+                            if row[3].value else None)
+
+        part_no = last_part_no
+        nomen = str(row[11].value).strip() if row[11].value else None
+        dsi = str(row[12].value).strip() if row[12].value else None
+
+        current_block = block_map[idx]
+        pn_cell = row[9]  # PN cell for THIS block
+
+        if parent_t_val == "D":
+            continue
+
+        # ---- NEW: Skip description logic if PN_to_desc missing OR no PF/MD in this block ----
+        if part_no not in PN_to_desc:
+            continue
+
+        # ---- NEW: check block-wise DSI presence ----
+        # (only compare when THIS block has that DSI)
+        # (build_PN_has_dsi must be passed separately and available globally or nearby)
+        # Assume PN_has_dsi is available same as mark_missing
+        blocks = PN_has_dsi.get(part_no, [])
+        if current_block >= len(blocks) or blocks[current_block] is False:
+            continue  # <-- THIS FIXES THE WRONG ERROR SPREADING
+
+        # ---- Existing comparison logic ----
+        if dsi and dsi.lower() == dsi_match.lower():
+
+            if dsi_match.upper() in ("PF", "MD", "QDQ"):
+                left = normalize_fn(nomen) if nomen else ""
+                right = normalize_fn(PN_to_desc[part_no]) if PN_to_desc[part_no] else ""
+            else:
+                left = normalize_fn(nomen)
+                right = normalize_fn(PN_to_desc[part_no])
+
+            if left == right:
+                row[11].fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+                row[12].fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+            else:
+                row[11].fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+                row[12].fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+
+                # ---- NEW: Use pn_cell (block-wise) ----
+                add_error_comment_to_PN_cell(sheet3, part_no, error_msg_unmatched, pn_cell)
+
+def add_error_comment_to_PN_cell(sheet3, PN_val, text, pn_cell):
+    """
+    Add error note ONLY to the PN cell of the CURRENT block.
+    pn_cell = row[9] of the block that triggered the error
+    """
+
+    if pn_cell is None:
+        return
+
+    existing = pn_cell.comment.text if pn_cell.comment else None
+
+    # avoid duplicate lines
+    if existing:
+        lines = {ln.strip() for ln in existing.splitlines() if ln.strip()}
+        if text.strip() in lines:
+            return
+        new_text = existing + "\n" + text
+    else:
+        new_text = text
+
+    width_pt, height_pt = _comment_size_for_text(new_text)
+
+    try:
+        pn_cell.comment = Comment(new_text, author="System",
+                                  width=width_pt, height=height_pt)
+    except:
+        pn_cell.comment = Comment(new_text, author="System")
+
