@@ -1,140 +1,145 @@
-The main issue with the current code is that it calculates whether a "Part Number" has a specific DSI (like PF, MD, QD) **globally** for the whole file using `build_PN_has_dsi`.
+The reason the previous code didn't work is likely because of the helper function `add_error_comment_to_PN_cell` in your original code.
 
-If Part Number `1234567` appears in two different places (blocks), and **one** of them has "PF", your current code adds `1234567` to a "Has PF" list. Consequently, it marks **both** places as correct, even if one is missing it. Conversely, if checking for errors, it applies the error logic to all instances based on a single global check.
+**The Problem:**
+Your original `add_error_comment_to_PN_cell` function searches the **entire sheet** for every instance of a Part Number and adds a comment to all of them. So, even if my logic correctly identified that *only* the second block had an error, calling your helper function would accidentally force the error comment onto the first block (and every other block) too.
 
-To fix this, you must process the data **Block by Block** (Per Instance). A "Block" is defined as a row with a Part Number followed by rows with empty Part Numbers.
+**The Solution:**
+We must modify the specific cell **directly** without searching the whole sheet again.
 
-Here is the corrected solution.
+Here is the corrected, complete code block to replace the validation section in `main_code`.
 
-### 1\. Add this New Function
+### Step 1: Add this updated function inside your script
 
-Add this function inside your `App` class (or as a standalone function). This replaces the logic of `build_PN_has_dsi` combined with `mark_missing_PN_red...`.
+(You can place this inside `class App` or just above `main_code`. If inside the class, add `self.` where appropriate).
 
 ```python
-    def check_dsi_per_instance(self, sheet, pn_requirements_dict, target_dsi_list, error_msg, normalize_fn, exempt_dsi_list=None):
-        """
-        Iterates through the report sheet block by block.
-        For each block (instance of a Part No), it checks if the required DSI exists IN THAT BLOCK.
-        """
-        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+def check_dsi_per_instance(sheet, pn_requirements_dict, target_dsi_list, error_msg, normalize_fn, exempt_dsi_list=None):
+    from openpyxl.styles import PatternFill
+    from openpyxl.comments import Comment
+
+    red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+    
+    # Variables to hold the current block's data
+    current_pn_val = None
+    current_pn_cell = None
+    current_block_rows = []
+
+    # Helper to process a finished block
+    def process_block(pn_val, pn_cell, rows):
+        if not pn_val: return
+
+        # Normalize key for dictionary lookup
+        norm_pn = normalize_fn(pn_val)
         
-        # We need to buffer rows to define a "Block"
-        current_pn_val = None
-        current_pn_cell = None
-        current_block_rows = []
+        # 1. Check if this PN exists in our Requirements (from Sheet 2)
+        # If the PN is not in Sheet 2, we skip checking it.
+        if norm_pn not in pn_requirements_dict:
+            return 
 
-        # Helper to process a finished block
-        def process_block(pn_val, pn_cell, rows):
-            if not pn_val:
-                return
-
-            norm_pn = normalize_fn(pn_val)
+        # 2. Check if the Target DSI exists in THIS specific block
+        found_target = False
+        
+        for r in rows:
+            # Column 13 is Index 12 (DSI)
+            dsi_val = str(r[12].value).strip() if r[12].value else ""
             
-            # 1. Check if this Part Number requires validation (exists in Sheet 2 data)
-            if norm_pn not in pn_requirements_dict:
-                return 
-
-            # 2. Check logic: Does this specific block contain the target DSI?
-            found_target = False
-            found_exempt = False
+            # Check for target (e.g., "PF")
+            if dsi_val in target_dsi_list:
+                found_target = True
             
-            for r in rows:
-                # Column 13 is Index 12 (DSI)
-                dsi_val = str(r[12].value).strip() if r[12].value else ""
-                
-                if dsi_val in target_dsi_list:
-                    found_target = True
-                
-                # If you have special codes like 'CD' that skip validation
-                if exempt_dsi_list and dsi_val in exempt_dsi_list:
-                    found_exempt = True
+            # Check for exempt codes (e.g., "CD") if provided
+            if exempt_dsi_list and dsi_val in exempt_dsi_list:
+                # If we find an exempt code, we consider this block valid (or "found")
+                found_target = True 
 
-            # 3. Mark Error if target missing and not exempt
-            if not found_target and not found_exempt:
-                pn_cell.fill = red_fill
-                self.add_error_comment_to_PN_cell(sheet, pn_val, error_msg)
-
-        # Iterate rows to build blocks
-        for row in sheet.iter_rows(min_row=2):
-            pn_cell = row[9] # Column J
-            val = pn_cell.value
+        # 3. If missing, mark ONLY this specific cell
+        if not found_target:
+            # Apply Red Fill
+            pn_cell.fill = red_fill
             
-            if val:
-                # New Part Number found -> Process the PREVIOUS block
-                if current_pn_val is not None:
-                    process_block(current_pn_val, current_pn_cell, current_block_rows)
-                
-                # Start NEW block
-                current_pn_val = str(val).strip()
-                current_pn_cell = pn_cell
-                current_block_rows = [row]
-            else:
-                # Same block (Part Number is blank)
-                if current_pn_val is not None:
-                    current_block_rows.append(row)
+            # Apply Comment Manually (Do NOT use the global helper function)
+            existing_comment = pn_cell.comment
+            new_text = error_msg
+            
+            if existing_comment:
+                if new_text not in existing_comment.text:
+                    new_text = existing_comment.text + "\n" + new_text
+                else:
+                    new_text = existing_comment.text
+            
+            pn_cell.comment = Comment(new_text, author="System")
 
-        # Don't forget to process the very last block after the loop finishes
-        if current_pn_val is not None:
-            process_block(current_pn_val, current_pn_cell, current_block_rows)
+    # Iterate through rows starting from row 2
+    for row in sheet.iter_rows(min_row=2):
+        pn_cell = row[9] # Column J (Part Number)
+        val = pn_cell.value
+        
+        # If we find a value in Part Number column, it's the start of a new block
+        if val:
+            # Process the PREVIOUS block before starting the new one
+            if current_pn_val is not None:
+                process_block(current_pn_val, current_pn_cell, current_block_rows)
+            
+            # Start tracking new block
+            current_pn_val = str(val).strip()
+            current_pn_cell = pn_cell
+            current_block_rows = [row] # Start list with header row
+        else:
+            # It's a continuation row (Blank PN), add to current block
+            if current_pn_val is not None:
+                current_block_rows.append(row)
 
-    # Note: Ensure add_error_comment_to_PN_cell is available as self.add_... or standalone
-    def add_error_comment_to_PN_cell(self, sheet3, PN_val, text="Error desc"):
-         # ... (Use your existing comment logic here) ...
-         # If you kept your existing function outside the class, call it directly.
-         pass
+    # Don't forget the very last block in the file
+    if current_pn_val is not None:
+        process_block(current_pn_val, current_pn_cell, current_block_rows)
 ```
 
-### 2\. Update `main_code`
+### Step 2: Update your `main_code`
 
-You need to replace the calls that use `build_PN_has_dsi` and `mark_missing_PN_red...` with this new function.
-
-Find this section in your `main_code` and **Replace** it with the code below:
+Replace the relevant validation section in your `main_code` function with this logic. This removes the `build_PN_has_dsi` logic entirely.
 
 ```python
-    # ------------------ REPLACED SECTION ------------------
-    
-    # 1. VALIDATE PF
-    # Build requirement list from Sheet 2
+    # ... inside main_code ...
+
+    # 1. VALIDATE PF (Block by Block)
     PN_to_desc, PN_header_cell = build_PN_desc(self.sheet2, "PN", "PF", "PF", slice(3, 12))
     
-    # Process PF per instance (Block by Block)
-    # This replaces: build_PN_has_dsi AND mark_missing_PN_red_for_desc
-    self.check_dsi_per_instance(
-        self.sheet3, 
-        PN_to_desc, 
-        target_dsi_list=["PF"], 
-        error_msg="Missing PF in FCR", 
-        normalize_fn=normalize_PN
+    check_dsi_per_instance(
+        self.sheet3,
+        pn_requirements_dict=PN_to_desc,
+        target_dsi_list=["PF"],
+        error_msg="Missing PF in FCR",
+        normalize_fn=normalize_PN,
+        exempt_dsi_list=["CD"]  # <--- Added CD here so it won't error if CD is present
     )
 
-    # 2. VALIDATE MD
+    # 2. VALIDATE MD (Block by Block)
     PN_to_desc6, PN_header_cell6 = build_PN_desc(self.sheet2, "PN", "MD", "PF", slice(3, 12))
     
-    self.check_dsi_per_instance(
-        self.sheet3, 
-        PN_to_desc6, 
-        target_dsi_list=["MD"], 
-        error_msg="Missing MD in FCR", 
+    check_dsi_per_instance(
+        self.sheet3,
+        pn_requirements_dict=PN_to_desc6,
+        target_dsi_list=["MD"],
+        error_msg="Missing MD in FCR",
         normalize_fn=normalize_PN
     )
 
-    # 3. VALIDATE SD (Assuming '14' logic builds the list of Parts needing SD)
+    # 3. VALIDATE SD (Block by Block)
     PN_to_desc2 = build_PN_desc_simple(self.sheet2, "PN", "14", slice(3, 12))
     
-    self.check_dsi_per_instance(
+    check_dsi_per_instance(
         self.sheet3,
-        PN_to_desc2,
+        pn_requirements_dict=PN_to_desc2,
         target_dsi_list=["SD"],
         error_msg="Missing SD in FCR",
         normalize_fn=normalize_PN
     )
 
-    # ------------------------------------------------------
+    # ... Continue with your QD / MU / MN logic ...
 ```
 
-### Key Changes Explained
+### Key Differences:
 
-1.  **Removal of Sets:** We no longer generate a `set` of Part Numbers that have "PF".
-2.  **State Reset:** The `current_block_rows` list is cleared every time a new Part Number appears in Column J.
-3.  **Isolation:** When checking Part Number `1234567` (Instance 1), we only look at the rows belonging to Instance 1. When we reach `1234567` (Instance 2), we treat it as a fresh check.
-4.  **Exemptions:** If the presence of "Cd" (as you mentioned) means the error should be ignored, pass `exempt_dsi_list=["Cd", "CD"]` to the function call.
+1.  **Direct Cell Modification:** `pn_cell.comment = ...` is done on the variable passed from the loop. It does not call `get_PN_cells`, so it will never accidentally paint other cells.
+2.  **Exempt List:** I added `exempt_dsi_list`. If you pass `["CD"]` (like in the PF example above), finding "CD" in the block will prevent the error, exactly as you requested.
+3.  **Strict Blocking:** The logic strictly groups rows: `[Header Row (PN)] + [Blank PN Rows]`. It resets cleanly every time a new Part Number appears.
