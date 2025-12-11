@@ -1,89 +1,138 @@
-def add_error_comment_to_cell(sheet, row_index, col_index, text, author="System"):
+def build_MD_desc_from_steps(sheet2):
     """
-    Attach `text` as a comment to sheet.cell(row_index, col_index).
-    Does not duplicate identical lines if already present.
+    Returns:
+       MD_map = {
+           "12345678": ["desc1", "desc2", ...],
+           "98765432": ["desc1"],
+           ...
+       }
     """
-    cell = sheet.cell(row=row_index, column=col_index)
-    existing = cell.comment.text if cell.comment else None
-    if existing:
-        # avoid adding duplicate message lines
-        existing_lines = [ln.strip() for ln in existing.splitlines() if ln.strip()]
-        if text.strip() in existing_lines:
-            return
-        new_text = existing + "\n" + text
-    else:
-        new_text = text
+    MD_map = {}
+    last_pn = None
+    pending_pn = False
 
-    width_pt, height_pt = _comment_size_for_text(new_text)
-    try:
-        cell.comment = Comment(new_text, author=author, width=width_pt, height=height_pt)
-    except TypeError:
-        # older openpyxl may not accept width/height in constructor
-        c = Comment(new_text, author=author)
-        try:
-            c.width = width_pt
-            c.height = height_pt
-        except Exception:
-            pass
-        cell.comment = c
+    for row in sheet2.iter_rows(min_row=1):
+        first = str(row[0].value).strip() if row[0].value else None
+
+        if not first:
+            continue
+
+        # Detect new PN start
+        if first.upper() == "PN":
+            pending_pn = True
+            continue
+
+        if pending_pn:
+            last_pn = first
+            pending_pn = False
+            continue
+
+        # Collect MD lines for this PN
+        if first.upper() == "MD" and last_pn:
+            desc_parts = []
+            for cell in row[3:12]:  # columns 4-12 contain MD description
+                if cell.value:
+                    desc_parts.append(str(cell.value).strip())
+            desc = " ".join(desc_parts).strip()
+
+            MD_map.setdefault(last_pn, []).append(desc)
+
+    return MD_map
 
 
-def mark_missing_PF_per_block(sheet3, PN_to_desc):
-    red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-    blocks = build_PN_blocks_with_dsi(sheet3)
+def build_MD_blocks_from_fcr(sheet3):
+    """
+    Returns:
+      [
+        {"pn": "12345678", "md_desc": ["a","b"], "rows": [2,3,4]},
+        {"pn": "23456789", "md_desc": ["x"],     "rows": [5,6]},
+        ...
+      ]
+    """
+    blocks = []
+    current_pn = None
+    current_rows = []
+    current_md_desc = []
+
+    for row_cells in sheet3.iter_rows(min_row=2):
+        pn_val = row_cells[9].value
+        dsi_val = row_cells[12].value
+        nomen_val = row_cells[11].value
+
+        # New block starts
+        if pn_val:
+            # store previous block
+            if current_pn is not None:
+                blocks.append({
+                    "pn": current_pn,
+                    "md_desc": current_md_desc,
+                    "rows": current_rows
+                })
+
+            current_pn = str(pn_val).strip()
+            current_rows = []
+            current_md_desc = []
+
+        # add row to block
+        if current_pn:
+            current_rows.append(row_cells[0].row)
+
+            # collect MD rows
+            if dsi_val and str(dsi_val).strip().upper() == "MD":
+                if nomen_val:
+                    current_md_desc.append(str(nomen_val).strip())
+
+    # append last block
+    if current_pn:
+        blocks.append({
+            "pn": current_pn,
+            "md_desc": current_md_desc,
+            "rows": current_rows
+        })
+
+    return blocks
+
+
+def validate_MD_per_block(sheet3, MD_map_steps):
+    red = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+    blocks = build_MD_blocks_from_fcr(sheet3)
 
     for blk in blocks:
         pn = blk["pn"]
-        dsis = blk["dsis"]
+        fcr_md_list = blk["md_desc"]
+        parent_row = blk["rows"][0]
 
-        # PF expected for this PN?
-        if pn not in PN_to_desc:
+        steps_md_list = MD_map_steps.get(pn, [])
+
+        steps_count = len(steps_md_list)
+        fcr_count = len(fcr_md_list)
+
+        # CASE 1: FCR has MD but steps has NO MD
+        if fcr_count > 0 and steps_count == 0:
+            sheet3.cell(row=parent_row, column=10).fill = red
+            add_error_comment_to_cell(sheet3, parent_row, 10, "MD present in FCR but not in STEP DATA")
             continue
 
-        # PF missing in this block?
-        if "PF" not in [d.upper() for d in dsis]:
-            # mark only the FIRST ROW (the parent row) of this block
-            parent_row_index = blk["rows"][0]
-            sheet3.cell(row=parent_row_index, column=10).fill = red_fill  # column 10 = Part No (J)
-            add_error_comment_to_cell(sheet3, parent_row_index, 10, "Missing PF in this occurrence")
-
-
-def compare_and_color(sheet3, PN_to_desc, dsi_match,
-                      error_msg_unmatched, normalize_fn):
-    last_part_no = None
-    parent_row_index = None
-    parent_t_val = None
-
-    for row in sheet3.iter_rows(min_row=2):
-        if row[9].value:
-            # new parent found -> update both PN and its row index
-            last_part_no = normalize_fn(row[9].value)
-            parent_row_index = row[9].row
-            parent_t_val = str(row[3].value).strip() if row[3].value else None
-
-        part_no = last_part_no
-        nomen = str(row[11].value).strip() if row[11].value else None
-        dsi = str(row[12].value).strip() if row[12].value else None
-
-        if parent_t_val == "D":
+        # CASE 2: Steps has MD but FCR has none
+        if steps_count > 0 and fcr_count == 0:
+            sheet3.cell(row=parent_row, column=10).fill = red
+            add_error_comment_to_cell(sheet3, parent_row, 10, "Missing MD in FCR")
             continue
 
-        if dsi and dsi.lower() == dsi_match.lower() and part_no in PN_to_desc:
-            desc = PN_to_desc[part_no]
+        # CASE 3: Counts mismatch
+        if steps_count != fcr_count:
+            sheet3.cell(row=parent_row, column=10).fill = red
+            add_error_comment_to_cell(
+                sheet3, parent_row, 10,
+                f"MD count mismatch: expected {steps_count}, got {fcr_count}"
+            )
+            continue
 
-            if dsi_match.upper() in ("PF", "MD", "QDQ"):
-                left = normalize(nomen) if nomen is not None else ""
-                right = normalize(desc) if desc is not None else ""
-            else:
-                left = normalize_PN(nomen)
-                right = normalize_PN(desc)
+        # CASE 4: Compare descriptions (unordered)
+        # Use sets but consider duplicates -> use multisets (Counter)
+        from collections import Counter
+        if Counter([d.lower() for d in steps_md_list]) != Counter([d.lower() for d in fcr_md_list]):
+            sheet3.cell(row=parent_row, column=10).fill = red
+            add_error_comment_to_cell(sheet3, parent_row, 10, "MD description mismatch")
+            continue
 
-            if left == right:
-                row[11].fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
-                row[12].fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
-            else:
-                row[11].fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-                row[12].fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-                # ADD comment only on this block's parent cell (not globally)
-                if parent_row_index:
-                    add_error_comment_to_cell(sheet3, parent_row_index, 10, error_msg_unmatched)
