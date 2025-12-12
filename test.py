@@ -1,3 +1,68 @@
+def build_PN_blocks_with_dsi(sheet3):
+
+    blocks = []
+    current_pn = None
+    current_block_rows = []
+    current_dsis = []
+    current_block_deleted = False   # will skip whole block if parent row deleted
+
+    for row_cells in sheet3.iter_rows(min_row=2):
+
+        pn_val = row_cells[9].value
+        dsi_val = row_cells[12].value
+        t_val = row_cells[3].value   # T_VAL is column 4
+
+        # -------------------------------------------------------
+        # NEW BLOCK STARTS 
+        # -------------------------------------------------------
+        if pn_val:
+
+            # save previous block if not deleted
+            if current_pn is not None and not current_block_deleted:
+                blocks.append({
+                    "pn": current_pn,
+                    "dsis": current_dsis,
+                    "rows": current_block_rows
+                })
+
+            # start new block
+            current_pn = str(pn_val).strip()
+            current_block_rows = []
+            current_dsis = []
+
+            # check if parent row of PN is deleted
+            current_block_deleted = (
+                t_val and str(t_val).strip().upper() == "D"
+            )
+
+        # -------------------------------------------------------
+        # Add row to block
+        # -------------------------------------------------------
+        if current_pn:
+
+            current_block_rows.append(row_cells[0].row)
+
+            # ⭐ ALWAYS RECORD DSI PRESENCE (even if deleted)
+            # So we know PF/MD exists in report
+            if dsi_val:
+                current_dsis.append(str(dsi_val).strip())
+
+            # NOTE:
+            # Deleted DSIs will be ignored later in validator when comparing
+
+    # -------------------------------------------------------
+    # Append final block (if not deleted)
+    # -------------------------------------------------------
+    if current_pn and not current_block_deleted:
+        blocks.append({
+            "pn": current_pn,
+            "dsis": current_dsis,
+            "rows": current_block_rows
+        })
+
+    return blocks
+
+
 def validate_PF_block(sheet3, blk, PF_desc_steps):
     global PF_duplicate_blocks
 
@@ -8,60 +73,77 @@ def validate_PF_block(sheet3, blk, PF_desc_steps):
     rows = blk["rows"]
     parent_row = rows[0]
 
-    # ⭐ SKIP entire block if parent PN row is deleted
-    parent_t = sheet3.cell(row=parent_row, column=4).value
-    if parent_t and str(parent_t).strip().upper() == "D":
+    # ----------------------------------------
+    # Skip entire block if parent row is deleted
+    # ----------------------------------------
+    parent_t_val = sheet3.cell(row=parent_row, column=4).value
+    if parent_t_val and str(parent_t_val).strip().upper() == "D":
         return
 
-    # ⭐ We build TWO lists:
-    PF_raw = []     # detects PF presence (includes deleted)
-    PF_active = []  # used for comparison (excludes deleted)
+    # ----------------------------------------
+    # Collect PF rows
+    # PF_raw = all PF rows (even deleted)
+    # PF_active = only non-deleted PF rows
+    # ----------------------------------------
+    PF_raw = []
+    PF_active = []
 
     for r in rows:
-        dsi = sheet3.cell(row=r, column=13).value
-        if dsi and str(dsi).strip().upper() == "PF":
-            PF_raw.append(r)   # ALWAYS append here (even if deleted)
+        dsi_val = sheet3.cell(row=r, column=13).value
+        if not dsi_val or str(dsi_val).strip().upper() != "PF":
+            continue
 
-            # check t_val
-            t_val = sheet3.cell(row=r, column=4).value
-            if t_val and str(t_val).strip().upper() == "D":
-                continue      # skip deleted PF from active list
+        PF_raw.append(r)  # presence detection
 
-            PF_active.append(r)
+        t_val = sheet3.cell(row=r, column=4).value
+        if t_val and str(t_val).strip().upper() == "D":
+            continue  # skip deleted PF rows
 
-    pf_exists_in_fcr = len(PF_raw) > 0
+        PF_active.append(r)
+
+    pf_raw_count = len(PF_raw)
     pf_active_count = len(PF_active)
-    pf_exists_in_steps = PF_desc_steps is not None
+    pf_in_steps = PF_desc_steps is not None
 
     steps_norm = normalize(PF_desc_steps or "")
 
-    # ⭐ CASE 1 — PF exists in FCR but not in STEPS
-    if pf_exists_in_fcr and not pf_exists_in_steps:
+    # ----------------------------------------
+    # CASE 1: PF exists in FCR but NOT in STEPS
+    # ----------------------------------------
+    if pf_raw_count > 0 and not pf_in_steps:
         sheet3.cell(row=parent_row, column=10).fill = red
         add_error_comment_to_cell(sheet3, parent_row, 10,
                                   "PF found in FCR but not in STEP DATA")
 
-        # only mark ACTIVE (non-deleted) rows
+        # highlight only active PF rows (not deleted)
         for r in PF_active:
             sheet3.cell(row=r, column=12).fill = red
             sheet3.cell(row=r, column=13).fill = red
+
         return
 
-    # ⭐ CASE 2 — PF expected but not in FCR (raw PF list empty)
-    if pf_exists_in_steps and not pf_exists_in_fcr:
+    # ----------------------------------------
+    # CASE 2: PF expected in steps but NOT found in FCR
+    # deleted PF rows do NOT count
+    # ----------------------------------------
+    if pf_in_steps and pf_raw_count == 0:
         sheet3.cell(row=parent_row, column=10).fill = red
         add_error_comment_to_cell(sheet3, parent_row, 10,
                                   "Missing PF in this occurrence")
         return
 
-    # ⭐ CASE 3 — Multiple PF rows (only ACTIVE rows count)
+    # ----------------------------------------
+    # CASE 3: Multiple PF rows (only active PF count matters)
+    # ----------------------------------------
     if pf_active_count > 1:
         sheet3.cell(row=parent_row, column=10).fill = red
         add_error_comment_to_cell(sheet3, parent_row, 10,
                                   "Multiple PF rows found in this occurrence")
+
         PF_duplicate_blocks.add((pn, parent_row))
 
         matched_found = False
+
         for r in PF_active:
             nomen = sheet3.cell(row=r, column=12).value
             nomen_norm = normalize(nomen or "")
@@ -76,5 +158,5 @@ def validate_PF_block(sheet3, blk, PF_desc_steps):
 
         return
 
-    # Single PF case handled in compare_and_color
+    # single PF case → compare handled by compare_and_color
     return
