@@ -9,7 +9,7 @@ def validate_MD_per_block(sheet3, MD_map_steps):
         parent_row = blk["rows"][0]
 
         # -------------------------------------------------
-        # ⭐ Skip entire block if parent row is deleted
+        # Skip entire block if parent row is deleted
         # -------------------------------------------------
         t_parent = sheet3.cell(row=parent_row, column=4).value
         if t_parent and str(t_parent).strip().upper() == "D":
@@ -18,7 +18,7 @@ def validate_MD_per_block(sheet3, MD_map_steps):
         steps_md_list = MD_map_steps.get(pn, [])
 
         # -------------------------------------------------
-        # ⭐ Collect MD rows BUT ignore deleted rows
+        # Collect MD rows (ignore deleted rows)
         # -------------------------------------------------
         md_rows = []
         for r in blk["rows"]:
@@ -27,7 +27,7 @@ def validate_MD_per_block(sheet3, MD_map_steps):
 
                 t_val = sheet3.cell(row=r, column=4).value
                 if t_val and str(t_val).strip().upper() == "D":
-                    continue   # ignore deleted MD rows
+                    continue
 
                 md_rows.append(r)
 
@@ -43,7 +43,6 @@ def validate_MD_per_block(sheet3, MD_map_steps):
                 sheet3, parent_row, 10,
                 "MD present in FCR but not in STEP DATA"
             )
-
             for r in md_rows:
                 sheet3.cell(row=r, column=12).fill = red
                 sheet3.cell(row=r, column=13).fill = red
@@ -69,13 +68,28 @@ def validate_MD_per_block(sheet3, MD_map_steps):
                 sheet3, parent_row, 10,
                 f"MD count mismatch: expected {steps_count}, got {fcr_count}"
             )
-            continue
+
+            from collections import Counter
+            expected_counter = Counter([d.lower() for d in steps_md_list])
+            used_counter = Counter()
+
+            for r in md_rows:
+                nomen = sheet3.cell(row=r, column=12).value
+                norm = (nomen or "").strip().lower()
+
+                if expected_counter[norm] > used_counter[norm]:
+                    sheet3.cell(row=r, column=12).fill = green
+                    sheet3.cell(row=r, column=13).fill = green
+                    used_counter[norm] += 1
+                else:
+                    sheet3.cell(row=r, column=12).fill = red
+                    sheet3.cell(row=r, column=13).fill = red
+            continue   # ✅ FIXED position
 
         # -------------------------------------------------
         # CASE 4 → Description matching (unordered, duplicates safe)
         # -------------------------------------------------
         from collections import Counter
-
         expected_counter = Counter([d.lower() for d in steps_md_list])
         used_counter = Counter()
 
