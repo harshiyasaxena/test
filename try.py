@@ -1,50 +1,65 @@
-def read_FCR_parents(ws_report, IN_COL, PART_COL):
+def read_FCR_parents(ws_report, IN_COL, PART_COL, debug=True):
     """
-    Extract parents ONLY from FCR using IN hierarchy.
-    Rule:
-    - IN == 1 AND Part No present => parent
+    Extract parents ONLY from FCR based on IN hierarchy rules.
     """
-    parents = []
-    last_at_level = {}
 
-    for r_idx in range(2, ws_report.max_row + 1):
-        in_val = ws_report.cell(row=r_idx, column=IN_COL).value
-        part = ws_report.cell(row=r_idx, column=PART_COL).value
+    last_at_level = {}   # level -> most recent valid part
+    parents = set()
 
-        if not in_val or not part:
+    prev_in = None
+
+    for r_idx, row in enumerate(ws_report.iter_rows(min_row=2), start=2):
+        in_val = row[IN_COL - 1].value
+        part = row[PART_COL - 1].value
+
+        if part:
+            part = str(part).strip().upper()
+        else:
             continue
 
         try:
-            level = int(in_val)
-        except:
+            in_val = int(in_val)
+        except Exception:
             continue
 
-        part_u = normalize_spaces(str(part)).upper()
+        # BAC rule (global)
+        if part.startswith("BAC"):
+            if debug:
+                print(f"[SKIP BAC] row={r_idx} IN={in_val} part={part}")
+            continue
 
-        # Track last seen at this level
-        last_at_level[level] = part_u
+        if debug:
+            print(f"[ROW] row={r_idx} IN={in_val} part={part}")
 
-        # Clear deeper levels if IN goes backward
-        for l in list(last_at_level.keys()):
-            if l > level:
-                del last_at_level[l]
+        # Rule 1: IN == 1 → parent
+        if in_val == 1:
+            parents.add(part)
+            if debug:
+                print(f"  → PARENT (IN=1): {part}")
 
-        # IN == 1 => DEFINITE parent
-        if level == 1:
-            parents.append(part_u)
-            print(f"[FCR PARENT] row={r_idx} parent='{part_u}'")
+        # Rule 2: IN drop → new parent
+        if prev_in is not None and in_val < prev_in:
+            parents.add(part)
+            if debug:
+                print(f"  → PARENT (IN DROP {prev_in}->{in_val}): {part}")
 
-        # Debug hierarchy walk (very useful)
-        print(
-            f"[FCR ITER] row={r_idx} IN={level} part={part_u} "
-            f"parent={last_at_level.get(1)} "
-            f"lvl2={last_at_level.get(2)} "
-            f"lvl3={last_at_level.get(3)}"
-        )
+        # Rule 3: attach to IN-1 → promote that parent
+        parent_level = in_val - 1
+        if parent_level in last_at_level:
+            parent_candidate = last_at_level[parent_level]
+            parents.add(parent_candidate)
+            if debug:
+                print(
+                    f"  → CHILD of {parent_candidate} (IN={parent_level})"
+                )
 
-    print("\n[FINAL FCR PARENTS]")
-    for i, p in enumerate(parents, 1):
-        print(f"{i}. {p}")
-    print()
+        # update last seen at this level
+        last_at_level[in_val] = part
+        prev_in = in_val
+
+    if debug:
+        print("\n[FINAL PARENTS]")
+        for p in parents:
+            print(" ", p)
 
     return parents
